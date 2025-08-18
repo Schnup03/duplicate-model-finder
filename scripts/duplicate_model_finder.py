@@ -2,7 +2,7 @@ import os
 import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Iterable, List
+from typing import Dict, Iterator, List, Tuple
 
 try:
     import gradio as gr  # type: ignore
@@ -24,43 +24,72 @@ MODEL_DIRS = [
 
 MODEL_EXTS = (".ckpt", ".safetensors", ".pt")
 
-CHUNK_SIZE = 1 << 20  # 1MB
+# Larger chunks take better advantage of fast NVMe SSDs
+CHUNK_SIZE = 1 << 22  # 4MB
 
 
 def compute_hash(path: str) -> str:
-    """Compute SHA256 hash of a file."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-            h.update(chunk)
+    """Compute BLAKE2b hash of a file using a reusable buffer."""
+    h = hashlib.blake2b()
+    buf = bytearray(CHUNK_SIZE)
+    mv = memoryview(buf)
+    with open(path, "rb", buffering=0) as f:
+        while True:
+            n = f.readinto(mv)
+            if not n:
+                break
+            h.update(mv[:n])
     return h.hexdigest()
 
 
-def iter_model_files(stop_event: threading.Event | None = None) -> Iterable[str]:
-    """Yield paths to model files under the configured directories.
+def iter_model_files(
+    stop_event: threading.Event | None = None,
+) -> Iterator[Tuple[str, int]]:
+    """Yield ``(path, size)`` for model files under the configured directories.
 
-    Symlinks are followed and only unique real files are yielded to avoid
-    duplicate reporting when the same file is linked from multiple locations.
-    The ``stop_event`` may be set to request early termination.
+    ``os.scandir`` is used for efficient directory traversal and to obtain file
+    sizes in the same system call.  Symlinks are followed and only unique real
+    files are yielded to avoid duplicate reporting when the same file is linked
+    from multiple locations.  The ``stop_event`` may be set to request early
+    termination.
     """
+
     seen: set[str] = set()
+
+    def _scan(path: str) -> Iterator[Tuple[str, int]]:
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if stop_event and stop_event.is_set():
+                        return
+                    if entry.is_dir(follow_symlinks=True):
+                        yield from _scan(entry.path)
+                        if stop_event and stop_event.is_set():
+                            return
+                        continue
+                    if not entry.name.endswith(MODEL_EXTS):
+                        continue
+                    real = os.path.realpath(entry.path)
+                    if real in seen:
+                        continue
+                    try:
+                        size = entry.stat(follow_symlinks=True).st_size
+                    except OSError:
+                        continue
+                    seen.add(real)
+                    yield entry.path, size
+                    if stop_event and stop_event.is_set():
+                        return
+        except OSError:
+            return
+
     for dir in MODEL_DIRS:
-        if not os.path.isdir(dir):
-            continue
-        for root, _, files in os.walk(dir, followlinks=True):
-            for name in files:
-                if stop_event and stop_event.is_set():
-                    return
-                if not name.endswith(MODEL_EXTS):
-                    continue
-                path = os.path.join(root, name)
-                real = os.path.realpath(path)
-                if real in seen:
-                    continue
-                seen.add(real)
-                yield path
-                if stop_event and stop_event.is_set():
-                    return
+        if stop_event and stop_event.is_set():
+            break
+        if os.path.isdir(dir):
+            yield from _scan(dir)
+            if stop_event and stop_event.is_set():
+                break
 
 
 def find_duplicates(
@@ -69,24 +98,21 @@ def find_duplicates(
     """Search model directories for duplicate files.
 
     The search first groups files by size to avoid unnecessary hashing and then
-    computes SHA256 for files that share the same size. Hashing can be
+    computes BLAKE2b for files that share the same size. Hashing can be
     parallelised by setting ``hash_workers``.  If ``stop_event`` is set the
     search stops early.
 
     Returns a mapping of hash -> list of paths that share that hash.
     """
     size_map: Dict[int, List[str]] = {}
-    for path in iter_model_files(stop_event):
+    for path, size in iter_model_files(stop_event):
         if stop_event and stop_event.is_set():
             break
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            continue
         size_map.setdefault(size, []).append(path)
 
     hashes: Dict[str, List[str]] = {}
-    workers = hash_workers or (os.cpu_count() or 1)
+    # default to 2x CPU cores to better utilise fast storage and CPUs
+    workers = hash_workers or ((os.cpu_count() or 1) * 2)
     for paths in size_map.values():
         if stop_event and stop_event.is_set():
             break
@@ -131,10 +157,11 @@ def on_ui_tabs():
             select_all_btn = gr.Button(value="Select all")
             delete_btn = gr.Button(value="Delete selected")
 
+        max_workers = (os.cpu_count() or 1) * 2
         thread_slider = gr.Slider(
             minimum=1,
-            maximum=os.cpu_count() or 1,
-            value=os.cpu_count() or 1,
+            maximum=max_workers,
+            value=max_workers,
             step=1,
             label="Hash threads",
         )
