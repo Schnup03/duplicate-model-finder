@@ -25,8 +25,9 @@ MODEL_DIRS = [
 
 MODEL_EXTS = (".ckpt", ".safetensors", ".pt")
 
-# Larger chunks take better advantage of fast NVMe SSDs
-CHUNK_SIZE = 1 << 22  # 4MB
+# Larger chunks take better advantage of fast NVMe SSDs; 16MB balances
+# throughput and memory usage when many threads hash concurrently.
+CHUNK_SIZE = 1 << 24  # 16MB
 
 
 def compute_hash(path: str) -> str:
@@ -111,29 +112,32 @@ def find_duplicates(
             break
         size_map.setdefault(size, []).append(path)
 
-    hashes: Dict[str, List[str]] = {}
-    # default to 2x CPU cores to better utilise fast storage and CPUs
-    workers = hash_workers or ((os.cpu_count() or 1) * 2)
-    for paths in size_map.values():
-        if stop_event and stop_event.is_set():
-            break
-        if len(paths) < 2:
-            continue
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            future_to_path = {ex.submit(compute_hash, p): p for p in paths}
-            for future in as_completed(future_to_path):
-                if stop_event and stop_event.is_set():
-                    ex.shutdown(cancel_futures=True)
-                    break
-                path = future_to_path[future]
-                try:
-                    file_hash = future.result()
-                except OSError:
-                    continue
-                hashes.setdefault(file_hash, []).append(path)
-        if stop_event and stop_event.is_set():
-            break
+    if stop_event and stop_event.is_set():
+        return {}
 
+    hashes: Dict[str, List[str]] = {}
+    # default to 4x CPU cores to better utilise fast storage and CPUs
+    workers = hash_workers or ((os.cpu_count() or 1) * 4)
+    candidates: List[str] = []
+    for paths in size_map.values():
+        if len(paths) > 1:
+            candidates.extend(paths)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_to_path = {ex.submit(compute_hash, p): p for p in candidates}
+        for future in as_completed(future_to_path):
+            if stop_event and stop_event.is_set():
+                ex.shutdown(cancel_futures=True)
+                break
+            path = future_to_path[future]
+            try:
+                file_hash = future.result()
+            except OSError:
+                continue
+            hashes.setdefault(file_hash, []).append(path)
+
+    if stop_event and stop_event.is_set():
+        return {}
     return {h: p for h, p in hashes.items() if len(p) > 1}
 
 
@@ -175,11 +179,12 @@ def on_ui_tabs():
             select_all_btn = gr.Button(value="Select all")
             delete_btn = gr.Button(value="Delete selected")
 
-        max_workers = (os.cpu_count() or 1) * 2
+        max_workers = (os.cpu_count() or 1) * 8
+        default_workers = max_workers // 2
         thread_slider = gr.Slider(
             minimum=1,
             maximum=max_workers,
-            value=max_workers,
+            value=default_workers,
             step=1,
             label="Hash threads",
         )
