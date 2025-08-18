@@ -317,11 +317,14 @@ def on_ui_tabs():
     if gr is None:  # pragma: no cover - safety net for environments ohne Gradio
         raise ImportError("Gradio ist nicht installiert und wird für die UI benötigt.")
 
+    stop_event = threading.Event()
+
     with gr.Blocks() as ui:
         gr.Markdown("## Duplicate Model Finder")
 
         with gr.Row():
             scan_btn = gr.Button(value="Scan for duplicates")
+            cancel_btn = gr.Button(value="Cancel scan")
             trash_btn = gr.Button(value="Move selected to trash")
             delete_btn = gr.Button(value="Permanently delete selected")
 
@@ -341,9 +344,11 @@ def on_ui_tabs():
         result_box = gr.Textbox(label="Status", interactive=False)
 
         def do_scan():
-            duplicates = find_duplicates()
+            stop_event.clear()
+            duplicates = find_duplicates(stop_event=stop_event)
             text, choices = format_duplicates_for_display(duplicates)
-            return text, gr.update(choices=choices, value=[]), "Scan complete"
+            status = "Scan cancelled" if stop_event.is_set() else "Scan complete"
+            return text, gr.update(choices=choices, value=[]), status
 
         def do_trash(selected: List[str]):
             status, failed = move_files_to_trash(selected)
@@ -359,7 +364,13 @@ def on_ui_tabs():
                 return gr.update(value=failed), status
             return gr.update(value=[]), status
 
+        def cancel_scan():
+            """Request the running scan to stop."""
+            stop_event.set()
+            return "Cancelling…"
+
         scan_btn.click(fn=do_scan, outputs=[duplicates_box, delete_choices, result_box])
+        cancel_btn.click(fn=cancel_scan, outputs=result_box)
         trash_btn.click(fn=do_trash, inputs=delete_choices, outputs=[delete_choices, result_box])
         delete_btn.click(
             fn=do_delete,
