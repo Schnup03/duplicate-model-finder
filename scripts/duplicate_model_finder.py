@@ -1,4 +1,5 @@
 import os
+import re
 import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -136,6 +137,23 @@ def find_duplicates(
     return {h: p for h, p in hashes.items() if len(p) > 1}
 
 
+def pick_keep_path(paths: List[str]) -> str:
+    """Return the path to keep when multiple duplicates exist.
+
+    Filenames containing numbered parenthetical suffixes like ``"(1)"`` or
+    ``"(2)"`` are treated as copies and are therefore deprioritised.  Among
+    remaining candidates, the shortest filename is preferred as the original.
+    ``paths`` is assumed to be non-empty.
+    """
+
+    def rank(path: str) -> tuple[int, int, str]:
+        name = os.path.basename(path)
+        has_copy_suffix = bool(re.search(r"\(\d+\)", name))
+        return (has_copy_suffix, len(name), name)
+
+    return min(paths, key=rank)
+
+
 if __name__ == "__main__":
     duplicates = find_duplicates()
     for h, paths in duplicates.items():
@@ -193,8 +211,10 @@ def on_ui_tabs():
                 sorted_paths = sorted(paths)
                 for p in sorted_paths:
                     lines.append(f"  {p}")
-                keep = sorted_paths[0] if sorted_paths else ""
-                for p in sorted_paths[1:]:
+                keep = pick_keep_path(sorted_paths)
+                for p in sorted_paths:
+                    if p == keep:
+                        continue
                     table.append([keep, p])
                     choices.append(p)
             text = "\n".join(lines) if lines else "No duplicates found"
