@@ -103,6 +103,7 @@ def on_ui_tabs():
 
         with gr.Row():
             scan_btn = gr.Button(value="Scan for duplicates")
+            select_all_btn = gr.Button(value="Select all")
             delete_btn = gr.Button(value="Delete selected")
 
         duplicates_box = gr.Textbox(
@@ -110,6 +111,7 @@ def on_ui_tabs():
             interactive=False,
             lines=10,
         )
+        overview_table = gr.DataFrame(headers=["Keep", "Delete"], interactive=False)
         # Initialize with empty choices so that the list can be updated
         # dynamically after a scan.  Gradio requires the component to be
         # created with a ``choices`` parameter in order to modify it later via
@@ -117,18 +119,30 @@ def on_ui_tabs():
         # error and the UI would appear unresponsive.
         delete_choices = gr.CheckboxGroup(label="Select files to delete", choices=[])
         result_box = gr.Textbox(label="Status", interactive=False)
+        choices_state = gr.State([])
 
         def do_scan():
             duplicates = find_duplicates()
             lines = []
             choices = []
+            table = []
             for file_hash, paths in sorted(duplicates.items()):
                 lines.append(f"Hash {file_hash}:")
-                for p in sorted(paths):
+                sorted_paths = sorted(paths)
+                for p in sorted_paths:
                     lines.append(f"  {p}")
+                keep = sorted_paths[0] if sorted_paths else ""
+                for p in sorted_paths[1:]:
+                    table.append([keep, p])
                     choices.append(p)
             text = "\n".join(lines) if lines else "No duplicates found"
-            return text, gr.update(choices=choices, value=[]), "Scan complete"
+            return (
+                text,
+                gr.update(choices=choices, value=[]),
+                table,
+                choices,
+                "Scan complete",
+            )
 
         def do_delete(selected: List[str]):
             removed = []
@@ -142,7 +156,18 @@ def on_ui_tabs():
                 return f"Deleted {len(removed)} file(s)"
             return "No files deleted"
 
-        scan_btn.click(fn=do_scan, outputs=[duplicates_box, delete_choices, result_box])
+        def select_all(choices: List[str]):
+            return gr.update(value=choices)
+
+        scan_btn.click(
+            fn=do_scan,
+            outputs=[duplicates_box, delete_choices, overview_table, choices_state, result_box],
+        )
+        select_all_btn.click(
+            fn=select_all,
+            inputs=choices_state,
+            outputs=delete_choices,
+        )
         delete_btn.click(fn=do_delete, inputs=delete_choices, outputs=result_box)
 
     return [(ui, "Duplicate Models", "duplicate_model_finder")]
