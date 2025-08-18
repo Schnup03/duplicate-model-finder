@@ -49,16 +49,27 @@ def iter_model_files(
     directories: Sequence[str],
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
 ) -> Iterable[str]:
-    """Yield model file paths from the provided directories."""
+    """Yield model file paths from the provided directories.
+
+    Symlinks are followed and only unique real files are yielded so that the
+    same physical file linked from multiple locations is reported once.
+    """
 
     ext_tuple = tuple(ext.lower() for ext in extensions)
+    seen: set[str] = set()
     for directory in directories:
         if not os.path.isdir(directory):
             continue
-        for root, _, files in os.walk(directory):
+        for root, _, files in os.walk(directory, followlinks=True):
             for name in files:
-                if name.lower().endswith(ext_tuple):
-                    yield os.path.join(root, name)
+                if not name.lower().endswith(ext_tuple):
+                    continue
+                path = os.path.join(root, name)
+                real = os.path.realpath(path)
+                if real in seen:
+                    continue
+                seen.add(real)
+                yield path
 
 
 def _size_duplicate_candidates(paths: Sequence[str]) -> List[str]:
