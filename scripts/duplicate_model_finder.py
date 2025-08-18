@@ -193,9 +193,11 @@ def on_ui_tabs():
             return "No files deleted"
 
         def select_all(choices: List[str]):
+            """Return an update selecting all available choices."""
             return gr.update(value=choices)
 
         def cancel_scan():
+            """Request the running scan to stop."""
             stop_event.set()
             return "Cancelling..."
 
