@@ -110,7 +110,12 @@ def on_ui_tabs():
             interactive=False,
             lines=10,
         )
-        delete_choices = gr.CheckboxGroup(label="Select files to delete")
+        # Initialize with empty choices so that the list can be updated
+        # dynamically after a scan.  Gradio requires the component to be
+        # created with a ``choices`` parameter in order to modify it later via
+        # ``gr.update``.  Without this, clicking the scan button would raise an
+        # error and the UI would appear unresponsive.
+        delete_choices = gr.CheckboxGroup(label="Select files to delete", choices=[])
         result_box = gr.Textbox(label="Status", interactive=False)
 
         def do_scan():
