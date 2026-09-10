@@ -1,0 +1,50 @@
+# pre-commit configuration for duplicate-model-finder
+#
+# Hook versions are pinned (per the GitHub Skill v2 policy of never using
+# unpinned third-party actions). Update with:
+#   pre-commit autoupdate
+#
+# Installation:
+#   pip install pre-commit
+#   pre-commit install            # enable on every git commit
+#   pre-commit run --all-files    # run once over the whole tree
+#
+# Skipping:
+#   SKIP=gitleaks git commit -m …  # skip gitleaks for one commit
+#
+# CI runs gitleaks separately via .github/workflows/ci.yml (gitleaks
+# gitleaks-action). The pre-commit hook here is for local pre-commit safety.
+
+repos:
+  # Secret detection (matches CI scan; pinned revision)
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+
+  # Python code formatting
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        language_version: python3
+        # Match pyproject.toml [tool.black] section
+        args: ["--line-length", "100", "--target-version", "py310,py311,py312"]
+
+  # Linting (matches pyproject.toml [tool.ruff])
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.14
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+
+  # Lightweight repo hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=4096]

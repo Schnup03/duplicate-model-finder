@@ -3,8 +3,8 @@ import hashlib
 import logging
 import os
 import threading
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import gradio as gr
@@ -14,13 +14,13 @@ except ImportError:  # pragma: no cover - only triggered in test environments wi
 logger = logging.getLogger(__name__)
 
 
-MODEL_DIRS: List[str] = [
+MODEL_DIRS: list[str] = [
     os.path.join("models", "Stable-diffusion"),
     os.path.join("models", "Lora"),
     os.path.join("models", "VAE"),
 ]
 
-ALLOWED_EXTENSIONS: Tuple[str, ...] = (".ckpt", ".safetensors", ".pt")
+ALLOWED_EXTENSIONS: tuple[str, ...] = (".ckpt", ".safetensors", ".pt")
 CHUNK_SIZE = 1 << 20  # 1MB
 # Upper bound for the hashing thread pool. The actual worker count is derived
 # from this default and the number of CPUs available at runtime.
@@ -49,7 +49,7 @@ def compute_hash(path: str, chunk_size: int = CHUNK_SIZE) -> str:
 def iter_model_files(
     directories: Sequence[str],
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
-    stop_event: Optional[threading.Event] = None,
+    stop_event: threading.Event | None = None,
 ) -> Iterable[str]:
     """Yield model file paths from the provided directories.
 
@@ -85,8 +85,8 @@ def iter_model_files(
 
 def _size_duplicate_candidates(
     paths: Sequence[str],
-    stop_event: Optional[threading.Event] = None,
-) -> List[str]:
+    stop_event: threading.Event | None = None,
+) -> list[str]:
     """Return only paths that share their size with at least one other path.
 
     Files whose size is unique cannot be duplicates of any other file, so we
@@ -94,7 +94,7 @@ def _size_duplicate_candidates(
     supplied the loop returns whatever it has collected so far.
     """
 
-    size_groups: Dict[int, List[str]] = {}
+    size_groups: dict[int, list[str]] = {}
     for path in paths:
         if stop_event is not None and stop_event.is_set():
             return []
@@ -104,12 +104,7 @@ def _size_duplicate_candidates(
             # Skip files we cannot stat; the hash step would fail on them too.
             continue
         size_groups.setdefault(size, []).append(path)
-    return [
-        path
-        for group in size_groups.values()
-        if len(group) > 1
-        for path in group
-    ]
+    return [path for group in size_groups.values() if len(group) > 1 for path in group]
 
 
 def _format_utc_timestamp() -> str:
@@ -122,7 +117,7 @@ def _format_utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
 
-def _resolve_worker_count(max_workers: Optional[int]) -> int:
+def _resolve_worker_count(max_workers: int | None) -> int:
     """Pick a sane thread pool size based on the explicit override or CPU count."""
 
     if max_workers is not None and max_workers > 0:
@@ -135,9 +130,9 @@ def collect_hashes(
     file_paths: Iterable[str],
     *,
     use_size_prefilter: bool = True,
-    max_workers: Optional[int] = None,
-    stop_event: Optional[threading.Event] = None,
-) -> Dict[str, List[str]]:
+    max_workers: int | None = None,
+    stop_event: threading.Event | None = None,
+) -> dict[str, list[str]]:
     """Compute hashes for the provided files and group identical ones.
 
     With ``use_size_prefilter=True`` (default) files whose size is unique
@@ -161,9 +156,7 @@ def collect_hashes(
         return {}
 
     candidates = (
-        _size_duplicate_candidates(paths, stop_event=stop_event)
-        if use_size_prefilter
-        else paths
+        _size_duplicate_candidates(paths, stop_event=stop_event) if use_size_prefilter else paths
     )
     if not candidates:
         return {}
@@ -171,7 +164,7 @@ def collect_hashes(
     if stop_event is not None and stop_event.is_set():
         return {}
 
-    hashes: Dict[str, List[str]] = {}
+    hashes: dict[str, list[str]] = {}
     if len(candidates) == 1 or max_workers == 1:
         for path in candidates:
             if stop_event is not None and stop_event.is_set():
@@ -187,7 +180,7 @@ def collect_hashes(
 
     workers = _resolve_worker_count(max_workers)
 
-    def _hash_one(path: str) -> Optional[Tuple[str, str]]:
+    def _hash_one(path: str) -> tuple[str, str] | None:
         try:
             return path, compute_hash(path)
         except OSError:
@@ -211,9 +204,9 @@ def find_duplicates(
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
     *,
     use_size_prefilter: bool = True,
-    max_workers: Optional[int] = None,
-    stop_event: Optional[threading.Event] = None,
-) -> Dict[str, List[str]]:
+    max_workers: int | None = None,
+    stop_event: threading.Event | None = None,
+) -> dict[str, list[str]]:
     """Search model directories for duplicate files.
 
     Returns a mapping of hash -> list of paths that share that hash.
@@ -230,11 +223,11 @@ def find_duplicates(
     )
 
 
-def format_duplicates_for_display(duplicates: Dict[str, List[str]]) -> Tuple[str, List[str]]:
+def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str, list[str]]:
     """Prepare human-readable text and selection choices for the UI."""
 
-    lines: List[str] = []
-    choices: List[str] = []
+    lines: list[str] = []
+    choices: list[str] = []
     for file_hash, paths in duplicates.items():
         lines.append(f"Hash {file_hash}:")
         for path in paths:
@@ -244,7 +237,7 @@ def format_duplicates_for_display(duplicates: Dict[str, List[str]]) -> Tuple[str
     return text, choices
 
 
-def move_files_to_trash(paths: Sequence[str]) -> Tuple[str, List[str]]:
+def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
     """Move files into a sibling ``.duplicate_model_finder_trash/`` directory.
 
     This is the default safe workflow. Files remain on disk inside the trash
@@ -259,8 +252,8 @@ def move_files_to_trash(paths: Sequence[str]) -> Tuple[str, List[str]]:
     if not paths:
         return "No files moved", []
 
-    moved: List[str] = []
-    failed: List[str] = []
+    moved: list[str] = []
+    failed: list[str] = []
     for path in paths:
         path_str = str(path)
         if not os.path.exists(path_str):
@@ -308,7 +301,7 @@ def move_files_to_trash(paths: Sequence[str]) -> Tuple[str, List[str]]:
 def permanently_delete_files(
     paths: Sequence[str],
     confirm: bool = False,
-) -> Tuple[str, List[str]]:
+) -> tuple[str, list[str]]:
     """Permanently delete files. Requires explicit ``confirm=True``.
 
     Use :func:`move_files_to_trash` for the default safe workflow. This
@@ -320,9 +313,7 @@ def permanently_delete_files(
     """
 
     if not confirm:
-        logger.warning(
-            "Refused permanent delete without confirm=True for %d path(s)", len(paths)
-        )
+        logger.warning("Refused permanent delete without confirm=True for %d path(s)", len(paths))
         return (
             "Refusing to permanently delete without explicit confirm=True",
             [str(path) for path in paths],
@@ -331,8 +322,8 @@ def permanently_delete_files(
     if not paths:
         return "No files deleted", []
 
-    removed: List[str] = []
-    failed: List[str] = []
+    removed: list[str] = []
+    failed: list[str] = []
     for path in paths:
         path_str = str(path)
         if not os.access(path_str, os.W_OK):
@@ -354,7 +345,7 @@ def permanently_delete_files(
     return "No files deleted", failed
 
 
-def delete_files(paths: Sequence[str]) -> Tuple[str, List[str]]:
+def delete_files(paths: Sequence[str]) -> tuple[str, list[str]]:
     """Deprecated: kept for backward compatibility, now routes to move_files_to_trash().
 
     Use :func:`move_files_to_trash` or
@@ -392,10 +383,7 @@ def on_ui_tabs():
         # ``gr.update`` (fix from PR #3, commit 0efaead).
         delete_choices = gr.CheckboxGroup(label="Select files to handle", choices=[])
         confirm_check = gr.Checkbox(
-            label=(
-                "Yes, I really want to permanently delete the selected files "
-                "(irreversible)"
-            ),
+            label=("Yes, I really want to permanently delete the selected files " "(irreversible)"),
             value=False,
         )
         result_box = gr.Textbox(label="Status", interactive=False)
@@ -407,14 +395,14 @@ def on_ui_tabs():
             status = "Scan cancelled" if stop_event.is_set() else "Scan complete"
             return text, gr.update(choices=choices, value=[]), status
 
-        def do_trash(selected: List[str]):
+        def do_trash(selected: list[str]):
             status, failed = move_files_to_trash(selected)
             if failed:
                 # Keep the failed entries selected so users can retry.
                 return gr.update(value=failed), status
             return gr.update(value=[]), status
 
-        def do_delete(selected: List[str], confirm: bool):
+        def do_delete(selected: list[str], confirm: bool):
             status, failed = permanently_delete_files(selected, confirm=confirm)
             if failed:
                 # Keep the failed entries selected so users can retry.
