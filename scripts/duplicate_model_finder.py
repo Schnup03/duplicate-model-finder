@@ -372,6 +372,7 @@ def on_ui_tabs():
 
         with gr.Row():
             scan_btn = gr.Button(value="Scan for duplicates")
+            select_all_btn = gr.Button(value="Select all")
             cancel_btn = gr.Button(value="Cancel scan")
             trash_btn = gr.Button(value="Move selected to trash")
             delete_btn = gr.Button(value="Permanently delete selected")
@@ -386,6 +387,11 @@ def on_ui_tabs():
         # created with a ``choices`` parameter in order to modify it later via
         # ``gr.update`` (fix from PR #3, commit 0efaead).
         delete_choices = gr.CheckboxGroup(label="Select files to handle", choices=[])
+        # Holds the current choice list so the ``select_all_btn`` knows which
+        # paths belong to the last scan. Updated by ``do_scan`` after every
+        # run (restores the helper from PR #3 / commit 1b10314 that was
+        # skipped during the PR #13 rebase; closes #18).
+        choices_state = gr.State([])
         confirm_check = gr.Checkbox(
             label=("Yes, I really want to permanently delete the selected files " "(irreversible)"),
             value=False,
@@ -397,7 +403,13 @@ def on_ui_tabs():
             duplicates = find_duplicates(stop_event=stop_event)
             text, choices = format_duplicates_for_display(duplicates)
             status = "Scan cancelled" if stop_event.is_set() else "Scan complete"
-            return text, gr.update(choices=choices, value=[]), status
+            # Third return value pushes the freshly computed choices into
+            # ``choices_state`` so the select-all button can act on them.
+            return text, gr.update(choices=choices, value=[]), choices, status
+
+        def select_all_choices(choices: list[str]) -> list[str]:
+            """Return the full choice list to mark every entry as selected."""
+            return list(choices)
 
         def do_trash(selected: list[str]):
             status, failed = move_files_to_trash(selected)
@@ -418,7 +430,15 @@ def on_ui_tabs():
             stop_event.set()
             return "Cancelling…"
 
-        scan_btn.click(fn=do_scan, outputs=[duplicates_box, delete_choices, result_box])
+        scan_btn.click(
+            fn=do_scan,
+            outputs=[duplicates_box, delete_choices, choices_state, result_box],
+        )
+        select_all_btn.click(
+            fn=select_all_choices,
+            inputs=choices_state,
+            outputs=delete_choices,
+        )
         cancel_btn.click(fn=cancel_scan, outputs=result_box)
         trash_btn.click(fn=do_trash, inputs=delete_choices, outputs=[delete_choices, result_box])
         delete_btn.click(
