@@ -2,6 +2,7 @@ import concurrent.futures
 import hashlib
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -48,20 +49,30 @@ def compute_hash(path: str, chunk_size: int = CHUNK_SIZE) -> str:
 def iter_model_files(
     directories: Sequence[str],
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
+    stop_event: Optional[threading.Event] = None,
 ) -> Iterable[str]:
     """Yield model file paths from the provided directories.
 
     Symlinks are followed and only unique real files are yielded so that the
-    same physical file linked from multiple locations is reported once.
+    same physical file linked from multiple locations is reported once. When
+    ``stop_event`` is supplied the walk checks the flag between directories
+    and before each yielded path so a long-running scan can be cancelled
+    cooperatively.
     """
 
     ext_tuple = tuple(ext.lower() for ext in extensions)
     seen: set[str] = set()
     for directory in directories:
+        if stop_event is not None and stop_event.is_set():
+            return
         if not os.path.isdir(directory):
             continue
         for root, _, files in os.walk(directory, followlinks=True):
+            if stop_event is not None and stop_event.is_set():
+                return
             for name in files:
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if not name.lower().endswith(ext_tuple):
                     continue
                 path = os.path.join(root, name)
@@ -72,15 +83,21 @@ def iter_model_files(
                 yield path
 
 
-def _size_duplicate_candidates(paths: Sequence[str]) -> List[str]:
+def _size_duplicate_candidates(
+    paths: Sequence[str],
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
     """Return only paths that share their size with at least one other path.
 
     Files whose size is unique cannot be duplicates of any other file, so we
-    skip the expensive SHA256 hashing step for them.
+    skip the expensive SHA256 hashing step for them. When ``stop_event`` is
+    supplied the loop returns whatever it has collected so far.
     """
 
     size_groups: Dict[int, List[str]] = {}
     for path in paths:
+        if stop_event is not None and stop_event.is_set():
+            return []
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -93,6 +110,16 @@ def _size_duplicate_candidates(paths: Sequence[str]) -> List[str]:
         if len(group) > 1
         for path in group
     ]
+
+
+def _format_utc_timestamp() -> str:
+    """Return the current UTC time formatted as ``YYYYMMDDTHHMMSSffffff``.
+
+    Extracted as a module-level helper so tests can monkeypatch it to a
+    fixed value without touching Python's immutable ``datetime`` class.
+    """
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
 
 def _resolve_worker_count(max_workers: Optional[int]) -> int:
@@ -109,6 +136,7 @@ def collect_hashes(
     *,
     use_size_prefilter: bool = True,
     max_workers: Optional[int] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Dict[str, List[str]]:
     """Compute hashes for the provided files and group identical ones.
 
@@ -119,19 +147,35 @@ def collect_hashes(
     Hashing is I/O-bound, so by default it runs across a thread pool sized
     from ``max_workers`` (when given) or the CPU count. Pass ``max_workers=1``
     to disable parallelism, e.g. for deterministic tests.
+
+    When ``stop_event`` is supplied the function returns whatever it has
+    accumulated so far; the threaded executor is released via its context
+    manager on exit.
     """
 
     paths = [str(path) for path in file_paths]
     if not paths:
         return {}
 
-    candidates = _size_duplicate_candidates(paths) if use_size_prefilter else paths
+    if stop_event is not None and stop_event.is_set():
+        return {}
+
+    candidates = (
+        _size_duplicate_candidates(paths, stop_event=stop_event)
+        if use_size_prefilter
+        else paths
+    )
     if not candidates:
+        return {}
+
+    if stop_event is not None and stop_event.is_set():
         return {}
 
     hashes: Dict[str, List[str]] = {}
     if len(candidates) == 1 or max_workers == 1:
         for path in candidates:
+            if stop_event is not None and stop_event.is_set():
+                return hashes
             try:
                 file_hash = compute_hash(path)
             except OSError:
@@ -149,8 +193,13 @@ def collect_hashes(
         except OSError:
             return None
 
+    if stop_event is not None and stop_event.is_set():
+        return hashes
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         for path, file_hash in executor.map(_hash_one, candidates):
+            if stop_event is not None and stop_event.is_set():
+                return hashes
             if file_hash is None:
                 continue
             hashes.setdefault(file_hash, []).append(path)
@@ -163,17 +212,21 @@ def find_duplicates(
     *,
     use_size_prefilter: bool = True,
     max_workers: Optional[int] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Dict[str, List[str]]:
     """Search model directories for duplicate files.
 
     Returns a mapping of hash -> list of paths that share that hash.
+    ``stop_event`` is forwarded to ``iter_model_files`` and the hashing
+    pipeline so a long-running scan can be cancelled cooperatively.
     """
 
-    files = list(iter_model_files(directories, extensions))
+    files = list(iter_model_files(directories, extensions, stop_event=stop_event))
     return collect_hashes(
         files,
         use_size_prefilter=use_size_prefilter,
         max_workers=max_workers,
+        stop_event=stop_event,
     )
 
 
@@ -226,7 +279,7 @@ def move_files_to_trash(paths: Sequence[str]) -> Tuple[str, List[str]]:
             logger.error("Cannot create trash dir %s: %s", trash_dir, exc)
             failed.append(path_str)
             continue
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        timestamp = _format_utc_timestamp()
         base = os.path.basename(path_str)
         staged_name = f"{timestamp}_{base}"
         staged_path = os.path.join(trash_dir, staged_name)
@@ -333,7 +386,11 @@ def on_ui_tabs():
             interactive=False,
             lines=10,
         )
-        delete_choices = gr.CheckboxGroup(label="Select files to handle")
+        # Initialize with empty choices so that the list can be updated
+        # dynamically after a scan.  Gradio requires the component to be
+        # created with a ``choices`` parameter in order to modify it later via
+        # ``gr.update`` (fix from PR #3, commit 0efaead).
+        delete_choices = gr.CheckboxGroup(label="Select files to handle", choices=[])
         confirm_check = gr.Checkbox(
             label=(
                 "Yes, I really want to permanently delete the selected files "

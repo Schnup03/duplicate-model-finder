@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import threading
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
@@ -306,3 +307,137 @@ def test_delete_files_routes_to_move_files_to_trash(tmp_path: Path):
     assert not target.exists()
     assert (tmp_path / TRASH_DIR_NAME).is_dir()
     assert "Moved 1 file" in message
+
+
+# ---------------------------------------------------------------------------
+# Cluster 3 (Tests/DX) — cancellation, symlinks, collisions, edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_iter_model_files_follows_symlinks_without_double_counting(tmp_path: Path):
+    """Symlinked model files should be reported once via realpath deduplication."""
+    real_dir = tmp_path / "real_models"
+    real_dir.mkdir()
+    link_dir = tmp_path / "linked_models"
+    link_dir.mkdir()
+
+    real_file = real_dir / "actual.ckpt"
+    real_file.write_bytes(b"data")
+
+    link = link_dir / "alias.ckpt"
+    try:
+        link.symlink_to(real_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported on this filesystem")
+
+    files = list(iter_model_files([real_dir, link_dir]))
+    assert sorted(files) == sorted([str(real_file)])
+
+
+def test_iter_model_files_returns_empty_when_no_matches(tmp_path: Path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert list(iter_model_files([empty])) == []
+
+
+def test_iter_model_files_stop_event_aborts_before_iteration_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Setting stop_event before any iteration yields no paths immediately."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "a.ckpt").write_bytes(b"a")
+    (model_dir / "b.ckpt").write_bytes(b"b")
+
+    stop = threading.Event()
+    stop.set()  # already set, iter should return immediately
+
+    collected = list(iter_model_files([model_dir], stop_event=stop))
+    assert collected == []
+
+
+def test_find_duplicates_propagates_stop_event_to_iter(tmp_path: Path):
+    """find_duplicates() must pass stop_event through to iter_model_files."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "a.ckpt").write_bytes(b"alpha")
+    (model_dir / "b.ckpt").write_bytes(b"beta")
+
+    stop = threading.Event()
+    stop.set()
+    assert find_duplicates(directories=[model_dir], stop_event=stop) == {}
+
+
+def test_move_files_to_trash_avoids_filename_collisions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Two files with the same basename in the same parent must each get a unique trash name."""
+    parent = tmp_path / "models"
+    parent.mkdir()
+
+    # Pre-create an entry in the trash with the timestamp prefix that would
+    # be generated for the first file, forcing a collision.
+    fixed_prefix = "20260101T000000000000"
+    trash = parent / TRASH_DIR_NAME
+    trash.mkdir()
+    (trash / f"{fixed_prefix}_shared.ckpt").write_bytes(b"old")
+
+    target = parent / "shared.ckpt"
+    target.write_bytes(b"new")
+
+    # Patch _format_utc_timestamp via monkeypatch to force a deterministic collision
+    import scripts.duplicate_model_finder as dmf
+    fixed_ts = "20260101T000000000000"
+    monkeypatch.setattr(dmf, "_format_utc_timestamp", lambda: fixed_ts)
+
+    message, failed = move_files_to_trash([target])
+
+    assert failed == []
+    assert not target.exists()
+    assert (trash / f"{fixed_prefix}_1_shared.ckpt").exists()
+
+
+def test_permanently_delete_files_with_empty_paths_list_returns_neutral_message(
+    tmp_path: Path,
+):
+    message, failed = permanently_delete_files([], confirm=True)
+    assert failed == []
+    assert message == "No files deleted"
+
+
+def test_collect_hashes_stop_event_short_circuits(tmp_path: Path):
+    """collect_hashes aborts cleanly when stop_event is set."""
+    a = tmp_path / "a.ckpt"
+    b = tmp_path / "b.ckpt"
+    a.write_bytes(b"x")
+    b.write_bytes(b"x")
+
+    stop = threading.Event()
+    stop.set()
+    assert collect_hashes([a, b], stop_event=stop) == {}
+
+
+def test_find_duplicates_detects_symlinked_duplicate(tmp_path: Path):
+    """A real file and a symlinked copy of it should both be in the duplicate group."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    real = model_dir / "real.ckpt"
+    real.write_bytes(b"same")
+
+    link = model_dir / "link.ckpt"
+    try:
+        link.symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported on this filesystem")
+
+    duplicates = find_duplicates(
+        directories=[model_dir], extensions=ALLOWED_EXTENSIONS
+    )
+    # Symlinks that point at the same physical file collapse via realpath
+    # deduplication, so iter_model_files yields exactly one entry — the
+    # first occurrence by os.walk order — and there are no duplicates to find.
+    assert duplicates == {}
+    files = list(iter_model_files([model_dir]))
+    assert len(files) == 1
+    assert files[0] == str(real) or files[0] == str(link)

@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duplicate-model-finder"
+version = "0.1.0"
+description = "Extension for AUTOMATIC1111/stable-diffusion-webui that scans model directories for duplicate files."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Stefan", email = "1469666961968595068@users.noreply.example" },
+]
+keywords = ["stable-diffusion", "webui", "gradio", "duplicate-detection"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Plugins",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Graphics",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "black>=23.0",
+  "ruff>=0.1.0",
+  "mypy>=1.5",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Schnup03/duplicate-model-finder"
+"Bug Tracker" = "https://github.com/Schnup03/duplicate-model-finder/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scripts*"]
+exclude = ["tests*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+skip-string-normalization = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["scripts/__pycache__", "tests/__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PIE"]
+ignore = [
+  "E501",  # line-too-long (handled by formatter)
+  "B008",  # do not perform function calls in argument defaults (gradio pattern)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts are fine
+
+[tool.mypy]
+python_version = "3.10"
+strict_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+ignore_missing_imports = true
+exclude = ["scripts/__pycache__", "tests/__pycache__", ".git"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+]
+filterwarnings = [
+  "error",
+  "ignore::DeprecationWarning:gradio.*",
+]
