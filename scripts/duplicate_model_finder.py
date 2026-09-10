@@ -49,16 +49,27 @@ def iter_model_files(
     directories: Sequence[str],
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
 ) -> Iterable[str]:
-    """Yield model file paths from the provided directories."""
+    """Yield model file paths from the provided directories.
+
+    Symlinks are followed and only unique real files are yielded so that the
+    same physical file linked from multiple locations is reported once.
+    """
 
     ext_tuple = tuple(ext.lower() for ext in extensions)
+    seen: set[str] = set()
     for directory in directories:
         if not os.path.isdir(directory):
             continue
-        for root, _, files in os.walk(directory):
+        for root, _, files in os.walk(directory, followlinks=True):
             for name in files:
-                if name.lower().endswith(ext_tuple):
-                    yield os.path.join(root, name)
+                if not name.lower().endswith(ext_tuple):
+                    continue
+                path = os.path.join(root, name)
+                real = os.path.realpath(path)
+                if real in seen:
+                    continue
+                seen.add(real)
+                yield path
 
 
 def _size_duplicate_candidates(paths: Sequence[str]) -> List[str]:
@@ -306,11 +317,14 @@ def on_ui_tabs():
     if gr is None:  # pragma: no cover - safety net for environments ohne Gradio
         raise ImportError("Gradio ist nicht installiert und wird für die UI benötigt.")
 
+    stop_event = threading.Event()
+
     with gr.Blocks() as ui:
         gr.Markdown("## Duplicate Model Finder")
 
         with gr.Row():
             scan_btn = gr.Button(value="Scan for duplicates")
+            cancel_btn = gr.Button(value="Cancel scan")
             trash_btn = gr.Button(value="Move selected to trash")
             delete_btn = gr.Button(value="Permanently delete selected")
 
@@ -330,9 +344,11 @@ def on_ui_tabs():
         result_box = gr.Textbox(label="Status", interactive=False)
 
         def do_scan():
-            duplicates = find_duplicates()
+            stop_event.clear()
+            duplicates = find_duplicates(stop_event=stop_event)
             text, choices = format_duplicates_for_display(duplicates)
-            return text, gr.update(choices=choices, value=[]), "Scan complete"
+            status = "Scan cancelled" if stop_event.is_set() else "Scan complete"
+            return text, gr.update(choices=choices, value=[]), status
 
         def do_trash(selected: List[str]):
             status, failed = move_files_to_trash(selected)
@@ -348,7 +364,13 @@ def on_ui_tabs():
                 return gr.update(value=failed), status
             return gr.update(value=[]), status
 
+        def cancel_scan():
+            """Request the running scan to stop."""
+            stop_event.set()
+            return "Cancelling…"
+
         scan_btn.click(fn=do_scan, outputs=[duplicates_box, delete_choices, result_box])
+        cancel_btn.click(fn=cancel_scan, outputs=result_box)
         trash_btn.click(fn=do_trash, inputs=delete_choices, outputs=[delete_choices, result_box])
         delete_btn.click(
             fn=do_delete,
