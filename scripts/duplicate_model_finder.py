@@ -1,6 +1,7 @@
+import concurrent.futures
 import hashlib
 import os
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import gradio as gr
@@ -16,6 +17,9 @@ MODEL_DIRS: List[str] = [
 
 ALLOWED_EXTENSIONS: Tuple[str, ...] = (".ckpt", ".safetensors", ".pt")
 CHUNK_SIZE = 1 << 20  # 1MB
+# Upper bound for the hashing thread pool. The actual worker count is derived
+# from this default and the number of CPUs available at runtime.
+DEFAULT_HASH_WORKERS = 8
 
 
 def is_model_file(file_name: str, extensions: Sequence[str] = ALLOWED_EXTENSIONS) -> bool:
@@ -34,42 +38,125 @@ def compute_hash(path: str, chunk_size: int = CHUNK_SIZE) -> str:
     return hasher.hexdigest()
 
 
-def iter_model_files(directories: Sequence[str]) -> Iterable[str]:
+def iter_model_files(
+    directories: Sequence[str],
+    extensions: Sequence[str] = ALLOWED_EXTENSIONS,
+) -> Iterable[str]:
     """Yield model file paths from the provided directories."""
 
+    ext_tuple = tuple(ext.lower() for ext in extensions)
     for directory in directories:
         if not os.path.isdir(directory):
             continue
         for root, _, files in os.walk(directory):
             for name in files:
-                if is_model_file(name):
+                if name.lower().endswith(ext_tuple):
                     yield os.path.join(root, name)
 
 
-def collect_hashes(file_paths: Iterable[str]) -> Dict[str, List[str]]:
-    """Compute hashes for the provided files and group identical ones."""
+def _size_duplicate_candidates(paths: Sequence[str]) -> List[str]:
+    """Return only paths that share their size with at least one other path.
+
+    Files whose size is unique cannot be duplicates of any other file, so we
+    skip the expensive SHA256 hashing step for them.
+    """
+
+    size_groups: Dict[int, List[str]] = {}
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            # Skip files we cannot stat; the hash step would fail on them too.
+            continue
+        size_groups.setdefault(size, []).append(path)
+    return [
+        path
+        for group in size_groups.values()
+        if len(group) > 1
+        for path in group
+    ]
+
+
+def _resolve_worker_count(max_workers: Optional[int]) -> int:
+    """Pick a sane thread pool size based on the explicit override or CPU count."""
+
+    if max_workers is not None and max_workers > 0:
+        return max_workers
+    cpu_count = os.cpu_count() or 4
+    return min(DEFAULT_HASH_WORKERS, max(2, cpu_count))
+
+
+def collect_hashes(
+    file_paths: Iterable[str],
+    *,
+    use_size_prefilter: bool = True,
+    max_workers: Optional[int] = None,
+) -> Dict[str, List[str]]:
+    """Compute hashes for the provided files and group identical ones.
+
+    With ``use_size_prefilter=True`` (default) files whose size is unique
+    among the input set are skipped, which avoids hashing large model files
+    that cannot possibly be duplicates of any other file.
+
+    Hashing is I/O-bound, so by default it runs across a thread pool sized
+    from ``max_workers`` (when given) or the CPU count. Pass ``max_workers=1``
+    to disable parallelism, e.g. for deterministic tests.
+    """
+
+    paths = [str(path) for path in file_paths]
+    if not paths:
+        return {}
+
+    candidates = _size_duplicate_candidates(paths) if use_size_prefilter else paths
+    if not candidates:
+        return {}
 
     hashes: Dict[str, List[str]] = {}
-    for path in file_paths:
-        path_str = str(path)
-        file_hash = compute_hash(path_str)
-        hashes.setdefault(file_hash, []).append(path_str)
+    if len(candidates) == 1 or max_workers == 1:
+        for path in candidates:
+            try:
+                file_hash = compute_hash(path)
+            except OSError:
+                # File disappeared between the size prefilter and the hash
+                # step — skip it rather than crash the whole scan.
+                continue
+            hashes.setdefault(file_hash, []).append(path)
+        return hashes
+
+    workers = _resolve_worker_count(max_workers)
+
+    def _hash_one(path: str) -> Optional[Tuple[str, str]]:
+        try:
+            return path, compute_hash(path)
+        except OSError:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for path, file_hash in executor.map(_hash_one, candidates):
+            if file_hash is None:
+                continue
+            hashes.setdefault(file_hash, []).append(path)
     return hashes
 
 
 def find_duplicates(
     directories: Sequence[str] = MODEL_DIRS,
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
+    *,
+    use_size_prefilter: bool = True,
+    max_workers: Optional[int] = None,
 ) -> Dict[str, List[str]]:
     """Search model directories for duplicate files.
 
     Returns a mapping of hash -> list of paths that share that hash.
     """
 
-    files = iter_model_files(directories)
-    filtered_files = (path for path in files if is_model_file(os.path.basename(path), extensions))
-    hashes = collect_hashes(filtered_files)
-    return {file_hash: paths for file_hash, paths in hashes.items() if len(paths) > 1}
+    files = list(iter_model_files(directories, extensions))
+    return collect_hashes(
+        files,
+        use_size_prefilter=use_size_prefilter,
+        max_workers=max_workers,
+    )
 
 
 def format_duplicates_for_display(duplicates: Dict[str, List[str]]) -> Tuple[str, List[str]]:
