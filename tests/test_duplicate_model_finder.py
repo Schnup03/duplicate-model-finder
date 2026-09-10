@@ -8,6 +8,7 @@ import pytest
 
 from scripts.duplicate_model_finder import (
     ALLOWED_EXTENSIONS,
+    TRASH_DIR_NAME,
     collect_hashes,
     compute_hash,
     delete_files,
@@ -15,6 +16,8 @@ from scripts.duplicate_model_finder import (
     format_duplicates_for_display,
     is_model_file,
     iter_model_files,
+    move_files_to_trash,
+    permanently_delete_files,
 )
 
 
@@ -82,9 +85,10 @@ def test_delete_files_reports_failures(tmp_path: Path):
 
     message, failed = delete_files([deletable, tmp_path / "missing.pt"])
 
-    assert "failed to delete" in message
+    assert "Moved 1 file" in message
     assert failed == [str(tmp_path / "missing.pt")]
     assert not deletable.exists()
+    assert (tmp_path / TRASH_DIR_NAME).is_dir()
 
 
 def test_iter_model_files_yields_supported_models(tmp_path: Path):
@@ -202,3 +206,103 @@ def test_iter_model_files_respects_extensions_parameter(tmp_path: Path):
     files = list(iter_model_files([model_dir], extensions=(".txt", ".bin")))
 
     assert sorted(files) == sorted([str(txt), str(bin_)])
+
+
+# ---------------------------------------------------------------------------
+# Cluster 2 (Safety) — soft-delete + explicit permanent-delete confirmation
+# ---------------------------------------------------------------------------
+
+
+def test_move_files_to_trash_creates_sibling_trash_dir(tmp_path: Path):
+    target = tmp_path / "model.ckpt"
+    target.write_bytes(b"data")
+
+    message, failed = move_files_to_trash([target])
+
+    assert failed == []
+    assert "Moved 1 file" in message
+    assert "recoverable manually" in message
+    assert not target.exists()
+    trash_dir = tmp_path / TRASH_DIR_NAME
+    assert trash_dir.is_dir()
+    assert len(list(trash_dir.iterdir())) == 1
+
+
+def test_move_files_to_trash_handles_missing_files(tmp_path: Path):
+    real = tmp_path / "real.ckpt"
+    missing = tmp_path / "ghost.ckpt"
+    real.write_bytes(b"x")
+    # `missing` is never written.
+
+    message, failed = move_files_to_trash([real, missing])
+
+    assert failed == [str(missing)]
+    assert "Moved 1 file" in message
+    assert not real.exists()
+
+
+def test_move_files_to_trash_skips_unwriteable_files(tmp_path, monkeypatch):
+    target = tmp_path / "model.ckpt"
+    target.write_bytes(b"x")
+
+    monkeypatch.setattr(
+        "scripts.duplicate_model_finder.os.access", lambda *a, **kw: False
+    )
+
+    message, failed = move_files_to_trash([target])
+
+    assert failed == [str(target)]
+    assert target.exists()
+
+
+def test_move_files_to_trash_handles_empty_input(tmp_path):
+    message, failed = move_files_to_trash([])
+    assert failed == []
+    assert message == "No files moved"
+
+
+def test_permanently_delete_files_requires_confirm(tmp_path: Path):
+    target = tmp_path / "model.ckpt"
+    target.write_bytes(b"x")
+
+    message, failed = permanently_delete_files([target])  # default confirm=False
+
+    assert "Refusing" in message
+    assert "confirm=True" in message
+    assert failed == [str(target)]
+    assert target.exists()
+
+
+def test_permanently_delete_files_with_confirm(tmp_path: Path):
+    target = tmp_path / "model.ckpt"
+    target.write_bytes(b"x")
+
+    message, failed = permanently_delete_files([target], confirm=True)
+
+    assert "Permanently deleted 1" in message
+    assert failed == []
+    assert not target.exists()
+
+
+def test_permanently_delete_files_partial_failure(tmp_path: Path):
+    real = tmp_path / "real.ckpt"
+    real.write_bytes(b"x")
+    missing = tmp_path / "ghost.ckpt"
+
+    message, failed = permanently_delete_files([real, missing], confirm=True)
+
+    assert "Permanently deleted 1" in message
+    assert str(missing) in failed
+    assert not real.exists()
+
+
+def test_delete_files_routes_to_move_files_to_trash(tmp_path: Path):
+    target = tmp_path / "model.ckpt"
+    target.write_bytes(b"x")
+
+    message, failed = delete_files([target])
+
+    assert failed == []
+    assert not target.exists()
+    assert (tmp_path / TRASH_DIR_NAME).is_dir()
+    assert "Moved 1 file" in message

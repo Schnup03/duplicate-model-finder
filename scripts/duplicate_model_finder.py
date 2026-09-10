@@ -1,12 +1,16 @@
 import concurrent.futures
 import hashlib
+import logging
 import os
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import gradio as gr
 except ImportError:  # pragma: no cover - only triggered in test environments without Gradio
     gr = None
+
+logger = logging.getLogger(__name__)
 
 
 MODEL_DIRS: List[str] = [
@@ -20,6 +24,9 @@ CHUNK_SIZE = 1 << 20  # 1MB
 # Upper bound for the hashing thread pool. The actual worker count is derived
 # from this default and the number of CPUs available at runtime.
 DEFAULT_HASH_WORKERS = 8
+# Sibling directory used for soft-delete. The user can restore or permanently
+# delete files from there manually if needed.
+TRASH_DIR_NAME = ".duplicate_model_finder_trash"
 
 
 def is_model_file(file_name: str, extensions: Sequence[str] = ALLOWED_EXTENSIONS) -> bool:
@@ -173,25 +180,126 @@ def format_duplicates_for_display(duplicates: Dict[str, List[str]]) -> Tuple[str
     return text, choices
 
 
-def delete_files(paths: Sequence[str]) -> Tuple[str, List[str]]:
-    """Attempt to delete the provided paths and report the result."""
+def move_files_to_trash(paths: Sequence[str]) -> Tuple[str, List[str]]:
+    """Move files into a sibling ``.duplicate_model_finder_trash/`` directory.
+
+    This is the default safe workflow. Files remain on disk inside the trash
+    folder (with a UTC-timestamp prefix to avoid collisions) so the user can
+    inspect, restore, or permanently delete them later. Missing files and
+    files without write permission are skipped and reported in the failure
+    list rather than aborting the whole batch.
+
+    Returns ``(status_message, list_of_paths_that_failed)``.
+    """
+
+    if not paths:
+        return "No files moved", []
+
+    moved: List[str] = []
+    failed: List[str] = []
+    for path in paths:
+        path_str = str(path)
+        if not os.path.exists(path_str):
+            logger.warning("Skipping %s: file does not exist", path_str)
+            failed.append(path_str)
+            continue
+        if not os.access(path_str, os.W_OK):
+            logger.warning("No write permission for %s — cannot move", path_str)
+            failed.append(path_str)
+            continue
+        parent = os.path.dirname(os.path.abspath(path_str)) or "."
+        trash_dir = os.path.join(parent, TRASH_DIR_NAME)
+        try:
+            os.makedirs(trash_dir, exist_ok=True)
+        except OSError as exc:
+            logger.error("Cannot create trash dir %s: %s", trash_dir, exc)
+            failed.append(path_str)
+            continue
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        base = os.path.basename(path_str)
+        staged_name = f"{timestamp}_{base}"
+        staged_path = os.path.join(trash_dir, staged_name)
+        counter = 1
+        while os.path.exists(staged_path):
+            staged_name = f"{timestamp}_{counter}_{base}"
+            staged_path = os.path.join(trash_dir, staged_name)
+            counter += 1
+        try:
+            os.rename(path_str, staged_path)
+            moved.append(path_str)
+            logger.info("Moved to trash: %s -> %s", path_str, staged_path)
+        except OSError as exc:
+            logger.error("Failed to move %s to trash: %s", path_str, exc)
+            failed.append(path_str)
+
+    if moved and not failed:
+        message = f"Moved {len(moved)} file(s) to {TRASH_DIR_NAME}/ (recoverable manually)"
+    elif moved and failed:
+        message = f"Moved {len(moved)} file(s); failed to move {len(failed)}"
+    else:
+        message = "No files moved"
+    return message, failed
+
+
+def permanently_delete_files(
+    paths: Sequence[str],
+    confirm: bool = False,
+) -> Tuple[str, List[str]]:
+    """Permanently delete files. Requires explicit ``confirm=True``.
+
+    Use :func:`move_files_to_trash` for the default safe workflow. This
+    function is the irreversible escape hatch and is intentionally hostile
+    to silent misuse: passing ``confirm=False`` (the default) returns all
+    paths as failed and emits a warning.
+
+    Returns ``(status_message, list_of_paths_that_failed)``.
+    """
+
+    if not confirm:
+        logger.warning(
+            "Refused permanent delete without confirm=True for %d path(s)", len(paths)
+        )
+        return (
+            "Refusing to permanently delete without explicit confirm=True",
+            [str(path) for path in paths],
+        )
+
+    if not paths:
+        return "No files deleted", []
 
     removed: List[str] = []
     failed: List[str] = []
     for path in paths:
         path_str = str(path)
+        if not os.access(path_str, os.W_OK):
+            logger.warning("No write permission for %s — cannot delete", path_str)
+            failed.append(path_str)
+            continue
         try:
             os.remove(path_str)
             removed.append(path_str)
-        except OSError:
+            logger.info("Permanently deleted %s", path_str)
+        except OSError as exc:
+            logger.error("Failed to delete %s: %s", path_str, exc)
             failed.append(path_str)
+
     if removed and not failed:
-        message = f"Deleted {len(removed)} file(s)"
-    elif removed and failed:
-        message = f"Deleted {len(removed)} file(s); failed to delete {len(failed)}"
-    else:
-        message = "No files deleted"
-    return message, failed
+        return f"Permanently deleted {len(removed)} file(s)", failed
+    if removed and failed:
+        return f"Permanently deleted {len(removed)} file(s); failed to delete {len(failed)}", failed
+    return "No files deleted", failed
+
+
+def delete_files(paths: Sequence[str]) -> Tuple[str, List[str]]:
+    """Deprecated: kept for backward compatibility, now routes to move_files_to_trash().
+
+    Use :func:`move_files_to_trash` or
+    :func:`permanently_delete_files` ``(paths, confirm=True)`` explicitly in
+    new code.
+    """
+
+    logger.debug("delete_files() called — redirecting to move_files_to_trash()")
+    return move_files_to_trash(paths)
 
 
 def on_ui_tabs():
@@ -203,14 +311,22 @@ def on_ui_tabs():
 
         with gr.Row():
             scan_btn = gr.Button(value="Scan for duplicates")
-            delete_btn = gr.Button(value="Delete selected")
+            trash_btn = gr.Button(value="Move selected to trash")
+            delete_btn = gr.Button(value="Permanently delete selected")
 
         duplicates_box = gr.Textbox(
             label="Duplicate files",
             interactive=False,
             lines=10,
         )
-        delete_choices = gr.CheckboxGroup(label="Select files to delete")
+        delete_choices = gr.CheckboxGroup(label="Select files to handle")
+        confirm_check = gr.Checkbox(
+            label=(
+                "Yes, I really want to permanently delete the selected files "
+                "(irreversible)"
+            ),
+            value=False,
+        )
         result_box = gr.Textbox(label="Status", interactive=False)
 
         def do_scan():
@@ -218,14 +334,26 @@ def on_ui_tabs():
             text, choices = format_duplicates_for_display(duplicates)
             return text, gr.update(choices=choices, value=[]), "Scan complete"
 
-        def do_delete(selected: List[str]):
-            status, failed = delete_files(selected)
+        def do_trash(selected: List[str]):
+            status, failed = move_files_to_trash(selected)
+            if failed:
+                # Keep the failed entries selected so users can retry.
+                return gr.update(value=failed), status
+            return gr.update(value=[]), status
+
+        def do_delete(selected: List[str], confirm: bool):
+            status, failed = permanently_delete_files(selected, confirm=confirm)
             if failed:
                 # Keep the failed entries selected so users can retry.
                 return gr.update(value=failed), status
             return gr.update(value=[]), status
 
         scan_btn.click(fn=do_scan, outputs=[duplicates_box, delete_choices, result_box])
-        delete_btn.click(fn=do_delete, inputs=delete_choices, outputs=[delete_choices, result_box])
+        trash_btn.click(fn=do_trash, inputs=delete_choices, outputs=[delete_choices, result_box])
+        delete_btn.click(
+            fn=do_delete,
+            inputs=[delete_choices, confirm_check],
+            outputs=[delete_choices, result_box],
+        )
 
     return [(ui, "Duplicate Models", "duplicate_model_finder")]

@@ -27,7 +27,8 @@ git clone <repo_url> extensions/duplicate-model-finder
 1. Starten Sie die WebUI wie gewohnt.
 2. Öffnen Sie den Tab **Duplicate Models**.
 3. Klicken Sie auf **Scan for duplicates**, um doppelte Modelle zu ermitteln.
-4. Wählen Sie über die Checkboxen die überflüssigen Dateien aus und klicken Sie auf **Delete selected**.
+4. Wählen Sie über die Checkboxen die überflüssigen Dateien aus.
+5. Klicken Sie auf **Move selected to trash** (Standardweg, reversibel) **oder** auf **Permanently delete selected** (setzt zusätzlich die Bestätigungs-Checkbox voraus).
 
 Nach einem Scan werden alle gefundenen Doppelgänger mit ihrem Hash angezeigt. Dateien, die sich nicht löschen ließen, bleiben ausgewählt, sodass ein erneuter Versuch möglich ist.
 
@@ -49,3 +50,10 @@ pytest
 - **Size-Pre-Filter:** Vor dem SHA256-Hashing werden Dateien nach Größe gruppiert. Nur Dateien, die ihre Größe mit mindestens einer anderen Datei teilen, werden gehasht. Das spart bei großen Modell-Dateien (typischerweise mehrere GB pro `.safetensors`) erheblich I/O, weil eindeutige Dateien gar nicht erst gelesen werden.
 - **Paralleles Hashing:** Das Hashing läuft per Default in einem Thread-Pool mit bis zu 8 Workern, abhängig von der verfügbaren CPU-Anzahl. Beide Optimierungen lassen sich getrennt deaktivieren — `find_duplicates(use_size_prefilter=False, max_workers=1)` für rein sequentielles Verhalten (nützlich für deterministische Tests).
 - **Skalierung:** Bei 50 Modell-Dateien à 4 GB reduziert der Size-Pre-Filter die zu hashende Datenmenge typischerweise um >95 %; die Parallelisierung skaliert mit der Anzahl physischer Kerne.
+
+## Sicherheit
+
+- **Soft-Delete by Default:** Das Löschen verschiebt Dateien in einen Schwester-Ordner `.duplicate_model_finder_trash/` (mit UTC-Zeitstempel-Präfix zur Vermeidung von Namenskollisionen). Die Dateien bleiben auf der Festplatte und können manuell wiederhergestellt oder endgültig gelöscht werden — kein versehentlicher Datenverlust.
+- **Bestätigung für Permanent-Löschung:** Die Buttons „Move selected to trash" und „Permanently delete selected" sind getrennt. Der Permanent-Pfad verlangt zusätzlich eine explizite Bestätigung über die Checkbox „Yes, I really want to permanently delete the selected files" und nutzt intern `permanently_delete_files(paths, confirm=True)`.
+- **Permission-Check:** Vor jedem Lösch-Vorgang wird `os.access(path, os.W_OK)` geprüft; nicht beschreibbare Dateien werden übersprungen und im Status-Bericht aufgeführt (gleiche Liste bleibt ausgewählt für Retry).
+- **Logging:** Alle Lösch-Vorgänge werden über das `logging`-Modul dokumentiert (Logger-Name `scripts.duplicate_model_finder`). Fehler und verweigerte Aktionen landen auf `WARNING`/`ERROR`-Level, normale Operationen auf `INFO`.
