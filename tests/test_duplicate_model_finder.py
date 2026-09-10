@@ -1,13 +1,13 @@
-from pathlib import Path
 import sys
 import threading
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
-import pytest
+import pytest  # noqa: E402  (path setup above adds scripts/ to sys.path)
 
-from scripts.duplicate_model_finder import (
+from scripts.duplicate_model_finder import (  # noqa: E402  (path setup above)
     ALLOWED_EXTENSIONS,
     TRASH_DIR_NAME,
     collect_hashes,
@@ -186,9 +186,7 @@ def test_collect_hashes_ignores_files_that_cannot_be_stated(tmp_path: Path):
     # the hashing step itself survives a missing file.
 
     with_prefilter = collect_hashes([real, missing], max_workers=1)
-    without_prefilter = collect_hashes(
-        [real, missing], use_size_prefilter=False, max_workers=1
-    )
+    without_prefilter = collect_hashes([real, missing], use_size_prefilter=False, max_workers=1)
 
     assert with_prefilter == {}
     assert without_prefilter == {compute_hash(real): [str(real)]}
@@ -246,9 +244,7 @@ def test_move_files_to_trash_skips_unwriteable_files(tmp_path, monkeypatch):
     target = tmp_path / "model.ckpt"
     target.write_bytes(b"x")
 
-    monkeypatch.setattr(
-        "scripts.duplicate_model_finder.os.access", lambda *a, **kw: False
-    )
+    monkeypatch.setattr("scripts.duplicate_model_finder.os.access", lambda *a, **kw: False)
 
     message, failed = move_files_to_trash([target])
 
@@ -387,6 +383,7 @@ def test_move_files_to_trash_avoids_filename_collisions(
 
     # Patch _format_utc_timestamp via monkeypatch to force a deterministic collision
     import scripts.duplicate_model_finder as dmf
+
     fixed_ts = "20260101T000000000000"
     monkeypatch.setattr(dmf, "_format_utc_timestamp", lambda: fixed_ts)
 
@@ -431,9 +428,7 @@ def test_find_duplicates_detects_symlinked_duplicate(tmp_path: Path):
     except (OSError, NotImplementedError):
         pytest.skip("symlinks not supported on this filesystem")
 
-    duplicates = find_duplicates(
-        directories=[model_dir], extensions=ALLOWED_EXTENSIONS
-    )
+    duplicates = find_duplicates(directories=[model_dir], extensions=ALLOWED_EXTENSIONS)
     # Symlinks that point at the same physical file collapse via realpath
     # deduplication, so iter_model_files yields exactly one entry — the
     # first occurrence by os.walk order — and there are no duplicates to find.
