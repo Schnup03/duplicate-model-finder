@@ -61,7 +61,7 @@ def test_collect_hashes_groups_paths_by_hash(tmp_path: Path):
     second.write_bytes(b"hello")
     third.write_bytes(b"world")
 
-    hashes = collect_hashes([first, second, third])
+    hashes = collect_hashes([first, second, third], max_workers=1)
     assert len(hashes) == 2
     matching_group = next(paths for paths in hashes.values() if len(paths) == 2)
     assert sorted(matching_group) == sorted([str(first), str(second)])
@@ -100,3 +100,105 @@ def test_iter_model_files_yields_supported_models(tmp_path: Path):
     assert files == [str(valid)]
     assert invalid.exists()
 
+
+# ---------------------------------------------------------------------------
+# Cluster 1 (Performance) — size prefilter + parallel hashing
+# ---------------------------------------------------------------------------
+
+
+def test_collect_hashes_skips_unique_sizes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Files with unique sizes are skipped before the SHA256 I/O happens."""
+
+    first = tmp_path / "first.ckpt"
+    second = tmp_path / "second.ckpt"
+    lonely = tmp_path / "lonely.ckpt"
+    first.write_bytes(b"hello")
+    second.write_bytes(b"hello")
+    lonely.write_bytes(b"x")  # unique size — must be skipped
+
+    hash_calls: list[str] = []
+
+    def fake_compute_hash(path: str, chunk_size: int = 1 << 20) -> str:
+        hash_calls.append(path)
+        return compute_hash(path, chunk_size=chunk_size)
+
+    monkeypatch.setattr("scripts.duplicate_model_finder.compute_hash", fake_compute_hash)
+
+    hashes = collect_hashes([first, second, lonely], max_workers=1)
+
+    assert len(hashes) == 1
+    group = next(iter(hashes.values()))
+    assert sorted(group) == sorted([str(first), str(second)])
+    assert hash_calls == [str(first), str(second)]
+
+
+def test_collect_hashes_size_prefilter_disabled_hashes_everything(tmp_path: Path):
+    """With the prefilter disabled every file gets hashed."""
+
+    first = tmp_path / "first.ckpt"
+    second = tmp_path / "second.ckpt"
+    lonely = tmp_path / "lonely.ckpt"
+    first.write_bytes(b"hello")
+    second.write_bytes(b"hello")
+    lonely.write_bytes(b"x")
+
+    hashes = collect_hashes(
+        [first, second, lonely],
+        use_size_prefilter=False,
+        max_workers=1,
+    )
+
+    assert len(hashes) == 2
+    groups = sorted((len(paths), sorted(paths)) for paths in hashes.values())
+    assert groups == [(1, [str(lonely)]), (2, sorted([str(first), str(second)]))]
+
+
+def test_collect_hashes_parallel_matches_sequential(tmp_path: Path):
+    """The threaded path returns the same grouping as the serial one."""
+
+    files = []
+    for i in range(8):
+        path = tmp_path / f"file_{i}.ckpt"
+        # Half the files share content "alpha", half share "beta".
+        path.write_bytes(b"alpha" if i % 2 == 0 else b"beta")
+        files.append(path)
+
+    sequential = collect_hashes(files, max_workers=1)
+    parallel = collect_hashes(files, max_workers=4)
+
+    sequential_normalised = sorted(tuple(sorted(group)) for group in sequential.values())
+    parallel_normalised = sorted(tuple(sorted(group)) for group in parallel.values())
+    assert sequential_normalised == parallel_normalised
+
+
+def test_collect_hashes_ignores_files_that_cannot_be_stated(tmp_path: Path):
+    real = tmp_path / "real.ckpt"
+    missing = tmp_path / "ghost.ckpt"
+    real.write_bytes(b"x")
+    # `missing` is never written — must not crash the scan.
+    # With the size prefilter, missing is dropped during stat; real has a
+    # unique size so it is also dropped. Force the prefilter off to verify
+    # the hashing step itself survives a missing file.
+
+    with_prefilter = collect_hashes([real, missing], max_workers=1)
+    without_prefilter = collect_hashes(
+        [real, missing], use_size_prefilter=False, max_workers=1
+    )
+
+    assert with_prefilter == {}
+    assert without_prefilter == {compute_hash(real): [str(real)]}
+
+
+def test_iter_model_files_respects_extensions_parameter(tmp_path: Path):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    ckpt = model_dir / "model.ckpt"
+    txt = model_dir / "model.txt"
+    bin_ = model_dir / "model.bin"
+    ckpt.write_bytes(b"x")
+    txt.write_text("y")
+    bin_.write_bytes(b"z")
+
+    files = list(iter_model_files([model_dir], extensions=(".txt", ".bin")))
+
+    assert sorted(files) == sorted([str(txt), str(bin_)])

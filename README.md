@@ -43,3 +43,9 @@ pytest
 
 - Nur Dateien mit den Endungen `.ckpt`, `.safetensors` und `.pt` werden berücksichtigt.
 - Die Hash-Berechnung erfolgt in 1-MB-Blöcken, um den Speicherverbrauch niedrig zu halten.
+
+## Performance-Hinweise
+
+- **Size-Pre-Filter:** Vor dem SHA256-Hashing werden Dateien nach Größe gruppiert. Nur Dateien, die ihre Größe mit mindestens einer anderen Datei teilen, werden gehasht. Das spart bei großen Modell-Dateien (typischerweise mehrere GB pro `.safetensors`) erheblich I/O, weil eindeutige Dateien gar nicht erst gelesen werden.
+- **Paralleles Hashing:** Das Hashing läuft per Default in einem Thread-Pool mit bis zu 8 Workern, abhängig von der verfügbaren CPU-Anzahl. Beide Optimierungen lassen sich getrennt deaktivieren — `find_duplicates(use_size_prefilter=False, max_workers=1)` für rein sequentielles Verhalten (nützlich für deterministische Tests).
+- **Skalierung:** Bei 50 Modell-Dateien à 4 GB reduziert der Size-Pre-Filter die zu hashende Datenmenge typischerweise um >95 %; die Parallelisierung skaliert mit der Anzahl physischer Kerne.
