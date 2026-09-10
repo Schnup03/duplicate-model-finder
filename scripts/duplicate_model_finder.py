@@ -190,11 +190,15 @@ def collect_hashes(
         return hashes
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        for path, file_hash in executor.map(_hash_one, candidates):
+        for result in executor.map(_hash_one, candidates):
             if stop_event is not None and stop_event.is_set():
                 return hashes
-            if file_hash is None:
+            if result is None:
+                # File disappeared mid-scan (deleted, permission changed,
+                # symlink target removed, etc.) — skip it cleanly. Crashes
+                # the whole scan otherwise (issue #16).
                 continue
+            path, file_hash = result
             hashes.setdefault(file_hash, []).append(path)
     return hashes
 

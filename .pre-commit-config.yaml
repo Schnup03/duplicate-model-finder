@@ -28,8 +28,10 @@ repos:
     hooks:
       - id: black
         language_version: python3
-        # Match pyproject.toml [tool.black] section
-        args: ["--line-length", "100", "--target-version", "py310,py311,py312"]
+        # No `args` here — black reads its config from pyproject.toml's
+        # [tool.black] section (line-length 100, target-version py310/311/312).
+        # Passing --target-version py310,py311,py312 here would fail because
+        # black only accepts one Python version per invocation.
 
   # Linting (matches pyproject.toml [tool.ruff])
   - repo: https://github.com/astral-sh/ruff-pre-commit
