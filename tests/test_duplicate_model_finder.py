@@ -436,3 +436,27 @@ def test_find_duplicates_detects_symlinked_duplicate(tmp_path: Path):
     files = list(iter_model_files([model_dir]))
     assert len(files) == 1
     assert files[0] == str(real) or files[0] == str(link)
+
+
+def test_collect_hashes_parallel_skips_missing_file(tmp_path: Path):
+    """Regression for issue #16.
+
+    The parallel path in collect_hashes must skip files whose compute_hash
+    raises OSError (deleted mid-scan, permission changed, symlink target
+    removed, etc.) instead of crashing the whole scan with TypeError:
+    cannot unpack non-iterable NoneType object.
+    """
+
+    real = tmp_path / "real.ckpt"
+    real.write_bytes(b"x")
+    missing = tmp_path / "ghost.ckpt"
+    # `missing` is intentionally never created.
+
+    result = collect_hashes(
+        [real, missing],
+        use_size_prefilter=False,
+        max_workers=4,
+    )
+
+    expected_hash = compute_hash(real)
+    assert result == {expected_hash: [str(real)]}
