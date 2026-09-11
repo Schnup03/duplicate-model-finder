@@ -38,6 +38,11 @@ TRASH_RETENTION_DAYS = 30
 # set to an integer it enables auto-purge with that many days as retention;
 # when unset the UI button is the only path that can remove files from trash.
 TRASH_AUTO_EMPTY_DAYS_ENV = "TRASH_AUTO_EMPTY_DAYS"
+# NVMe-optimized hashing profile (issue #19 opt-in): 16 MB chunks + BLAKE2b.
+# Faster on NVMe + many-core CPUs at the cost of higher peak memory and a
+# non-standard hash that downstream tooling cannot reproduce. Off by default
+# so Cluster-1 callers (SHA256/1 MB/os.walk) stay unaffected.
+NVME_CHUNK_SIZE = 16 * 1024 * 1024
 
 
 def is_model_file(file_name: str, extensions: Sequence[str] = ALLOWED_EXTENSIONS) -> bool:
@@ -54,6 +59,96 @@ def compute_hash(path: str, chunk_size: int = CHUNK_SIZE) -> str:
         for chunk in iter(lambda: file_handle.read(chunk_size), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def compute_hash_blake2b(path: str, chunk_size: int = NVME_CHUNK_SIZE) -> str:
+    """Compute the BLAKE2b hash of a file with a larger read chunk (issue #19 opt-in).
+
+    Faster than SHA256 on modern x86_64 (AVX2 path) and pairs with
+    ``iter_model_files_scandir`` for the NVMe-tuned scan profile. Returns the
+    same digest-length string as :func:`compute_hash` so callers can plug it
+    into the existing ``collect_hashes`` plumbing unchanged.
+    """
+
+    hasher = hashlib.blake2b()
+    with open(path, "rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(chunk_size), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _scandir_walk(
+    directory: str, stop_event: threading.Event | None = None
+) -> Iterable[tuple[str, list[str], list[str]]]:
+    """Yield ``(root, dirs, files)`` tuples using ``os.scandir`` for speed.
+
+    Mirror of :func:`os.walk` but built on top of :func:`os.scandir` so each
+    file stat (used implicitly via ``DirEntry.is_file``) avoids the second
+    syscall that ``os.path.getsize`` would trigger. Symlinks are followed via
+    the ``follow_symlinks=True`` argument of ``is_dir``/``is_file``.
+    """
+    pending: list[str] = [directory]
+    while pending:
+        current = pending.pop()
+        if stop_event is not None and stop_event.is_set():
+            return
+        try:
+            scandir_it = os.scandir(current)
+        except OSError:
+            continue
+        dirs: list[str] = []
+        files: list[str] = []
+        with scandir_it:
+            for entry in scandir_it:
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        dirs.append(entry.name)
+                    elif entry.is_file(follow_symlinks=True):
+                        files.append(entry.name)
+                except OSError:
+                    continue
+        yield current, dirs, files
+        for d in dirs:
+            pending.append(os.path.join(current, d))
+
+
+def iter_model_files_scandir(
+    directories: Sequence[str],
+    extensions: Sequence[str] = ALLOWED_EXTENSIONS,
+    stop_event: threading.Event | None = None,
+) -> Iterable[str]:
+    """Yield model file paths using ``os.scandir`` instead of ``os.walk``.
+
+    NVMe-tuned variant of :func:`iter_model_files`: each file's ``stat()``
+    call is avoided because the ``DirEntry`` already caches the stat info, so
+    we save one syscall per file vs. the default walker. Same dedup-via-
+    ``realpath`` contract, so callers can swap implementations without
+    touching downstream grouping logic.
+    """
+    ext_tuple = tuple(ext.lower() for ext in extensions)
+    seen: set[str] = set()
+    for directory in directories:
+        if stop_event is not None and stop_event.is_set():
+            return
+        if not os.path.isdir(directory):
+            continue
+        for root, dirs, files in _scandir_walk(directory, stop_event):
+            if stop_event is not None and stop_event.is_set():
+                return
+            for name in files:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if not name.lower().endswith(ext_tuple):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    real = os.path.realpath(path)
+                except OSError:
+                    continue
+                if real in seen:
+                    continue
+                seen.add(real)
+                yield path
 
 
 def iter_model_files(
@@ -142,6 +237,7 @@ def collect_hashes(
     use_size_prefilter: bool = True,
     max_workers: int | None = None,
     stop_event: threading.Event | None = None,
+    prefer_nvme: bool = False,
 ) -> dict[str, list[str]]:
     """Compute hashes for the provided files and group identical ones.
 
@@ -180,7 +276,7 @@ def collect_hashes(
             if stop_event is not None and stop_event.is_set():
                 return hashes
             try:
-                file_hash = compute_hash(path)
+                file_hash = compute_hash_blake2b(path) if prefer_nvme else compute_hash(path)
             except OSError:
                 # File disappeared between the size prefilter and the hash
                 # step — skip it rather than crash the whole scan.
@@ -192,7 +288,7 @@ def collect_hashes(
 
     def _hash_one(path: str) -> tuple[str, str] | None:
         try:
-            return path, compute_hash(path)
+            return path, (compute_hash_blake2b(path) if prefer_nvme else compute_hash(path))
         except OSError:
             return None
 
@@ -220,20 +316,27 @@ def find_duplicates(
     use_size_prefilter: bool = True,
     max_workers: int | None = None,
     stop_event: threading.Event | None = None,
+    prefer_nvme: bool = False,
 ) -> dict[str, list[str]]:
     """Search model directories for duplicate files.
 
     Returns a mapping of hash -> list of paths that share that hash.
     ``stop_event`` is forwarded to ``iter_model_files`` and the hashing
     pipeline so a long-running scan can be cancelled cooperatively.
+
+    ``prefer_nvme=True`` swaps in the NVMe-tuned profile: ``os.scandir``
+    walker + BLAKE2b hashing with 16 MB chunks (closes #19). Off by default
+    so Cluster-1 callers (SHA256/1 MB/os.walk) stay byte-compatible.
     """
 
-    files = list(iter_model_files(directories, extensions, stop_event=stop_event))
+    walker = iter_model_files_scandir if prefer_nvme else iter_model_files
+    files = list(walker(directories, extensions, stop_event=stop_event))
     return collect_hashes(
         files,
         use_size_prefilter=use_size_prefilter,
         max_workers=max_workers,
         stop_event=stop_event,
+        prefer_nvme=prefer_nvme,
     )
 
 
@@ -454,9 +557,14 @@ def on_ui_tabs():
                    "in .duplicate_model_finder_trash/ older than the retention window)"),
             value=False,
         )
+        nvme_check = gr.Checkbox(
+            label=("Aggressive scan (NVMe-optimized, BLAKE2b + 16 MB chunks, "
+                   "opt-in feature flag from issue #19)"),
+            value=False,
+        )
         result_box = gr.Textbox(label="Status", interactive=False)
 
-        def do_scan(progress=gr.Progress()):
+        def do_scan(progress=gr.Progress(), prefer_nvme: bool = False):
             """Run the duplicate scan with progressive UI updates (closes #6).
 
             Implemented as a generator so Gradio can refresh the UI between
@@ -464,6 +572,9 @@ def on_ui_tabs():
             default-argument form Gradio injects at runtime; it renders as a
             non-blocking progress indicator and keeps the WebUI responsive
             while ``find_duplicates`` walks the model directories.
+
+            When ``prefer_nvme`` is set the NVMe-tuned profile is used:
+            ``iter_model_files_scandir`` + BLAKE2b hashing (closes #19 opt-in).
             """
             stop_event.clear()
             progress(0, desc="Starting scan…")
@@ -472,7 +583,8 @@ def on_ui_tabs():
                 gr.update(choices=[], value=[]),
                 f"Scanning {len(MODEL_DIRS)} root dir(s)…",
             )
-            files = list(iter_model_files(MODEL_DIRS, stop_event=stop_event))
+            walker = iter_model_files_scandir if prefer_nvme else iter_model_files
+            files = list(walker(MODEL_DIRS, stop_event=stop_event))
             if stop_event.is_set():
                 progress(1.0, desc="Cancelled")
                 yield (
@@ -487,13 +599,14 @@ def on_ui_tabs():
                 gr.update(choices=[], value=[]),
                 f"Hashing {len(files)} file(s)…",
             )
-            duplicates = collect_hashes(files, stop_event=stop_event)
+            duplicates = collect_hashes(files, stop_event=stop_event, prefer_nvme=prefer_nvme)
             text, choices = format_duplicates_for_display(duplicates)
             progress(1.0, desc="Done")
+            profile_note = " (NVMe-tuned)" if prefer_nvme else ""
             status = (
                 "Scan cancelled"
                 if stop_event.is_set()
-                else f"Scan complete — {len(duplicates)} hash group(s)"
+                else f"Scan complete{profile_note} — {len(duplicates)} hash group(s)"
             )
             # Third return value pushes the freshly computed choices into
             # ``choices_state`` so the select-all button can act on them.
@@ -530,6 +643,7 @@ def on_ui_tabs():
 
         scan_btn.click(
             fn=do_scan,
+            inputs=nvme_check,
             outputs=[duplicates_box, delete_choices, choices_state, result_box],
         )
         select_all_btn.click(

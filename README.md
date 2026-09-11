@@ -144,6 +144,7 @@ _Platzhalter — UI-Screenshots werden gerne via PR beigetragen. Die UI ist in `
 - **Size-Pre-Filter:** Vor dem SHA256-Hashing werden Dateien nach Größe gruppiert. Nur Dateien, die ihre Größe mit mindestens einer anderen Datei teilen, werden gehasht. Das spart bei großen Modell-Dateien (typischerweise mehrere GB pro `.safetensors`) erheblich I/O, weil eindeutige Dateien gar nicht erst gelesen werden.
 - **Paralleles Hashing:** Das Hashing läuft per Default in einem Thread-Pool mit bis zu 8 Workern, abhängig von der verfügbaren CPU-Anzahl. Beide Optimierungen lassen sich getrennt deaktivieren — `find_duplicates(use_size_prefilter=False, max_workers=1)` für rein sequentielles Verhalten (nützlich für deterministische Tests).
 - **Skalierung:** Bei 50 Modell-Dateien à 4 GB reduziert der Size-Pre-Filter die zu hashende Datenmenge typischerweise um >95 %; die Parallelisierung skaliert mit der Anzahl physischer Kerne.
+- **NVMe-optimiertes Profil (closes #19, opt-in):** Auf schnellen NVMe-Setups mit vielen Kernen lässt sich `find_duplicates(..., prefer_nvme=True)` aktivieren — das Profil nutzt `os.scandir` (vermeidet einen `os.path.getsize`-Syscall pro Datei) plus BLAKE2b-Hashing mit 16-MB-Chunks statt SHA256/1 MB. Im WebUI steht die Option als Checkbox „Aggressive scan (NVMe-optimized)" zur Verfügung. **Default ist weiterhin SHA256/1 MB/os.walk** — bestehende Caller bleiben byte-kompatibel, der alternative Hash-Wert ist nicht interchangeierbar.
 
 ## Sicherheit
 

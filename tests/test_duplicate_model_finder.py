@@ -14,11 +14,13 @@ from scripts.duplicate_model_finder import (  # noqa: E402  (path setup above)
     TRASH_DIR_NAME,
     collect_hashes,
     compute_hash,
+    compute_hash_blake2b,
     delete_files,
     find_duplicates,
     format_duplicates_for_display,
     is_model_file,
     iter_model_files,
+    iter_model_files_scandir,
     move_files_to_trash,
     permanently_delete_files,
     purge_old_trash,
@@ -557,3 +559,80 @@ def test_purge_old_trash_skips_subdirectories(tmp_path, monkeypatch):
 
     assert deleted == 0
     assert nested.is_dir()
+
+
+def test_compute_hash_blake2b_distinguishes_files(tmp_path):
+    """BLAKE2b digest must differ between distinct file contents."""
+    a = tmp_path / "a.ckpt"
+    b = tmp_path / "b.ckpt"
+    a.write_text("alpha")
+    b.write_text("beta")
+    assert compute_hash_blake2b(str(a)) != compute_hash_blake2b(str(b))
+
+
+def test_compute_hash_blake2b_is_deterministic(tmp_path):
+    """Same content must yield the same BLAKE2b digest across calls."""
+    target = tmp_path / "model.ckpt"
+    target.write_text("payload")
+    assert compute_hash_blake2b(str(target)) == compute_hash_blake2b(str(target))
+
+
+def test_compute_hash_blake2b_handles_large_files(tmp_path):
+    """BLAKE2b with the 16 MB default chunk must handle > NVME_CHUNK_SIZE."""
+    target = tmp_path / "large.ckpt"
+    # 32 MB > NVME_CHUNK_SIZE (16 MB)
+    target.write_bytes(b"\x00" * (32 * 1024 * 1024))
+    digest = compute_hash_blake2b(str(target))
+    # BLAKE2b default digest length is 64 bytes -> 128 hex chars
+    assert len(digest) == 128
+
+
+def test_iter_model_files_scandir_yields_same_set_as_default(tmp_path, monkeypatch):
+    """Scandir walker must surface every model file the default walker does."""
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "a.ckpt").write_text("a")
+    sub = models / "sub"
+    sub.mkdir()
+    (sub / "b.safetensors").write_text("b")
+    (sub / "ignored.txt").write_text("not a model")
+
+    default_paths = set(iter_model_files([str(models)]))
+    scandir_paths = set(iter_model_files_scandir([str(models)]))
+
+    assert scandir_paths == default_paths
+    # And the ignored file must not show up in either.
+    assert all(not p.endswith("ignored.txt") for p in scandir_paths)
+
+
+def test_find_duplicates_prefer_nvme_produces_distinct_digests(tmp_path, monkeypatch):
+    """NVMe profile must still detect duplicates AND differ from SHA256."""
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
+    (tmp_path / "a.ckpt").write_text("payload")
+    (tmp_path / "b.ckpt").write_text("payload")  # duplicate content
+
+    # default: SHA256 — duplicates detected
+    default = find_duplicates([str(tmp_path)])
+    assert len(default) == 1
+
+    # NVMe profile: still detects the duplicate (BLAKE2b on same payload matches)
+    nvme = find_duplicates([str(tmp_path)], prefer_nvme=True)
+    assert len(nvme) == 1
+
+    # The two profiles must produce different digests for the same payload.
+    default_digest = next(iter(default))
+    nvme_digest = next(iter(nvme))
+    assert default_digest != nvme_digest
+
+
+def test_find_duplicates_prefer_nvme_respects_stop_event(tmp_path, monkeypatch):
+    """Cancellation must short-circuit the NVMe walker just like the default."""
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
+    (tmp_path / "a.ckpt").write_text("payload")
+    (tmp_path / "b.ckpt").write_text("different")
+    stop_event = threading.Event()
+    stop_event.set()  # cancelled before start
+
+    result = find_duplicates([str(tmp_path)], stop_event=stop_event, prefer_nvme=True)
+    assert result == {}
