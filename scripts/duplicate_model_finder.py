@@ -398,11 +398,45 @@ def on_ui_tabs():
         )
         result_box = gr.Textbox(label="Status", interactive=False)
 
-        def do_scan():
+        def do_scan(progress=gr.Progress()):
+            """Run the duplicate scan with progressive UI updates (closes #6).
+
+            Implemented as a generator so Gradio can refresh the UI between
+            the file-walk and the hashing phases. ``gr.Progress()`` is the
+            default-argument form Gradio injects at runtime; it renders as a
+            non-blocking progress indicator and keeps the WebUI responsive
+            while ``find_duplicates`` walks the model directories.
+            """
             stop_event.clear()
-            duplicates = find_duplicates(stop_event=stop_event)
+            progress(0, desc="Starting scan…")
+            yield (
+                "Scanning…",
+                gr.update(choices=[], value=[]),
+                f"Scanning {len(MODEL_DIRS)} root dir(s)…",
+            )
+            files = list(iter_model_files(MODEL_DIRS, stop_event=stop_event))
+            if stop_event.is_set():
+                progress(1.0, desc="Cancelled")
+                yield (
+                    "Scan cancelled",
+                    gr.update(choices=[], value=[]),
+                    "Cancelled before hashing",
+                )
+                return
+            progress(0.2, desc=f"Found {len(files)} model file(s); hashing…")
+            yield (
+                f"Found {len(files)} model file(s); computing hashes…",
+                gr.update(choices=[], value=[]),
+                f"Hashing {len(files)} file(s)…",
+            )
+            duplicates = collect_hashes(files, stop_event=stop_event)
             text, choices = format_duplicates_for_display(duplicates)
-            status = "Scan cancelled" if stop_event.is_set() else "Scan complete"
+            progress(1.0, desc="Done")
+            status = (
+                "Scan cancelled"
+                if stop_event.is_set()
+                else f"Scan complete — {len(duplicates)} hash group(s)"
+            )
             # Third return value pushes the freshly computed choices into
             # ``choices_state`` so the select-all button can act on them.
             return text, gr.update(choices=choices, value=[]), choices, status
