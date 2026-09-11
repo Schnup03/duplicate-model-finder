@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 
@@ -28,6 +29,15 @@ DEFAULT_HASH_WORKERS = 8
 # Sibling directory used for soft-delete. The user can restore or permanently
 # delete files from there manually if needed.
 TRASH_DIR_NAME = ".duplicate_model_finder_trash"
+# Default retention window for ``purge_old_trash``: files older than this many
+# days are eligible for automatic deletion when ``TRASH_AUTO_EMPTY_DAYS`` is
+# set in the environment. The UI button always uses this default as well; the
+# env-var only controls *whether* auto-purge runs at scan-start.
+TRASH_RETENTION_DAYS = 30
+# Environment variable that opts the WebUI into automatic trash purging. When
+# set to an integer it enables auto-purge with that many days as retention;
+# when unset the UI button is the only path that can remove files from trash.
+TRASH_AUTO_EMPTY_DAYS_ENV = "TRASH_AUTO_EMPTY_DAYS"
 
 
 def is_model_file(file_name: str, extensions: Sequence[str] = ALLOWED_EXTENSIONS) -> bool:
@@ -241,6 +251,48 @@ def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str
     return text, choices
 
 
+def purge_old_trash(retention_days: int = TRASH_RETENTION_DAYS) -> tuple[str, int]:
+    """Delete files in any ``.duplicate_model_finder_trash/`` older than N days.
+
+    Scans every ``MODEL_DIRS`` tree for ``TRASH_DIR_NAME`` sub-directories and
+    removes files whose ``mtime`` is older than the cutoff. Returns a
+    human-readable status and the number of files removed.
+    """
+    if retention_days < 0:
+        return "Invalid retention_days: must be >= 0", 0
+    cutoff = time.time() - (retention_days * 86400)
+    deleted = 0
+    trash_dirs_scanned = 0
+    for root_dir in MODEL_DIRS:
+        if not os.path.isdir(root_dir):
+            continue
+        for current, dirs, _files in os.walk(root_dir):
+            if TRASH_DIR_NAME in dirs:
+                trash_path = os.path.join(current, TRASH_DIR_NAME)
+                trash_dirs_scanned += 1
+                try:
+                    for entry in os.listdir(trash_path):
+                        entry_path = os.path.join(trash_path, entry)
+                        if not os.path.isfile(entry_path):
+                            continue
+                        try:
+                            if os.path.getmtime(entry_path) < cutoff:
+                                os.unlink(entry_path)
+                                deleted += 1
+                                logger.info("Purged trash file: %s", entry_path)
+                        except OSError as exc:
+                            logger.error("Cannot purge %s: %s", entry_path, exc)
+                except OSError as exc:
+                    logger.error("Cannot list trash dir %s: %s", trash_path, exc)
+                # Don't descend into the trash dir for further walking.
+                dirs.remove(TRASH_DIR_NAME)
+    return (
+        f"Purged {deleted} file(s) older than {retention_days} day(s) "
+        f"from {trash_dirs_scanned} trash dir(s)",
+        deleted,
+    )
+
+
 def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
     """Move files into a sibling ``.duplicate_model_finder_trash/`` directory.
 
@@ -376,6 +428,7 @@ def on_ui_tabs():
             cancel_btn = gr.Button(value="Cancel scan")
             trash_btn = gr.Button(value="Move selected to trash")
             delete_btn = gr.Button(value="Permanently delete selected")
+            empty_trash_btn = gr.Button(value="Empty trash")
 
         duplicates_box = gr.Textbox(
             label="Duplicate files",
@@ -394,6 +447,11 @@ def on_ui_tabs():
         choices_state = gr.State([])
         confirm_check = gr.Checkbox(
             label=("Yes, I really want to permanently delete the selected files " "(irreversible)"),
+            value=False,
+        )
+        empty_trash_confirm = gr.Checkbox(
+            label=("Yes, empty the entire trash (irreversible, all model file(s) "
+                   "in .duplicate_model_finder_trash/ older than the retention window)"),
             value=False,
         )
         result_box = gr.Textbox(label="Status", interactive=False)
@@ -425,6 +483,12 @@ def on_ui_tabs():
                 return gr.update(value=failed), status
             return gr.update(value=[]), status
 
+        def do_empty_trash(confirm: bool):
+            """Permanently delete all trash files older than the retention window."""
+            if not confirm:
+                return "Empty-trash cancelled: confirmation required"
+            return purge_old_trash()[0]
+
         def cancel_scan():
             """Request the running scan to stop."""
             stop_event.set()
@@ -445,6 +509,11 @@ def on_ui_tabs():
             fn=do_delete,
             inputs=[delete_choices, confirm_check],
             outputs=[delete_choices, result_box],
+        )
+        empty_trash_btn.click(
+            fn=do_empty_trash,
+            inputs=empty_trash_confirm,
+            outputs=result_box,
         )
 
     return [(ui, "Duplicate Models", "duplicate_model_finder")]
