@@ -14,6 +14,11 @@ except ImportError:  # pragma: no cover - only triggered in test environments wi
 
 logger = logging.getLogger(__name__)
 
+# Diagnostic: bestaetigt im WebUI-Terminal dass das Script tatsaechlich geladen wurde.
+# Wichtig fuer reForge/Forge-Diagnose wenn der Tab nicht erscheint - ohne diesen Print
+# kann man nicht zwischen "Script nicht geladen" und "Script geladen, Tab nicht gemounted" unterscheiden.
+print(f"[duplicate_model_finder] MODULE LOADED pid={os.getpid()}", flush=True)
+
 
 MODEL_DIRS: list[str] = [
     os.path.join("models", "Stable-diffusion"),
@@ -517,12 +522,17 @@ def delete_files(paths: Sequence[str]) -> tuple[str, list[str]]:
 
 
 def on_ui_tabs():
+    print("[duplicate_model_finder] on_ui_tabs() CALLED", flush=True)
     if gr is None:  # pragma: no cover - safety net for environments ohne Gradio
         raise ImportError("Gradio ist nicht installiert und wird für die UI benötigt.")
 
     stop_event = threading.Event()
 
-    with gr.Blocks() as ui:
+    # ``title=`` und ``analytics_enabled=False`` sind Forge/reForge-Best-Practice.
+    # Ohne ``title=`` rendern manche Forge-Versionen den Tab nicht korrekt im Mount-Layer,
+    # und ``analytics_enabled=False`` verhindert gradio-Telemetry-Calls die im WebUI-Kontext
+    # nichts zu suchen haben. vanilla A1111 akzeptiert die Parameter ebenfalls problemlos.
+    with gr.Blocks(title="Duplicate Models", analytics_enabled=False) as ui:
         gr.Markdown("## Duplicate Model Finder")
 
         with gr.Row():
@@ -664,4 +674,6 @@ def on_ui_tabs():
             outputs=result_box,
         )
 
-    return [(ui, "Duplicate Models", "duplicate_model_finder")]
+    result = [(ui, "Duplicate Models", "duplicate_model_finder")]
+    print(f"[duplicate_model_finder] on_ui_tabs() RETURNING {len(result)} tab(s)", flush=True)
+    return result
