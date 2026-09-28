@@ -521,7 +521,25 @@ def delete_files(paths: Sequence[str]) -> tuple[str, list[str]]:
     return move_files_to_trash(paths)
 
 
+# Guard flag: prevents double-mount if both A1111's auto-discovery AND
+# script_callbacks.on_ui_tabs() registration paths are active in the same
+# WebUI instance. Reset only on full WebUI restart (Python module reload).
+_ui_tab_mounted = False
+
+
 def on_ui_tabs():
+    global _ui_tab_mounted
+    if _ui_tab_mounted:
+        # Guard against double-mount: can happen when Forge/reForge activates
+        # both the module-function path (A1111 auto-discovery) AND the
+        # script_callbacks.on_ui_tabs() hook. We want the tab mounted exactly
+        # once regardless of which path fires first.
+        print(
+            "[duplicate_model_finder] on_ui_tabs() already mounted, skipping duplicate",
+            flush=True,
+        )
+        return []
+    _ui_tab_mounted = True
     print("[duplicate_model_finder] on_ui_tabs() CALLED", flush=True)
     if gr is None:  # pragma: no cover - safety net for environments ohne Gradio
         raise ImportError("Gradio ist nicht installiert und wird für die UI benötigt.")
@@ -677,3 +695,33 @@ def on_ui_tabs():
     result = [(ui, "Duplicate Models", "duplicate_model_finder")]
     print(f"[duplicate_model_finder] on_ui_tabs() RETURNING {len(result)} tab(s)", flush=True)
     return result
+
+
+# Forge/reForge-compatible tab registration via script_callbacks.
+#
+# Why: reForge 1.10.x has its own extension layer that does NOT always
+# auto-detect module-level on_ui_tabs() the way vanilla A1111 does. The
+# script_callbacks.on_ui_tabs(callback) hook is the documented A1111+/Forge
+# API and works on every modern WebUI. Registering it here is a no-op for
+# vanilla A1111 (which still finds the module function via auto-discovery)
+# and ensures the tab actually mounts on Forge/reForge when the auto-discovery
+# path is the one silently failing.
+#
+# The dedupe guard inside on_ui_tabs() prevents double-mount when both paths
+# fire in the same WebUI instance.
+try:
+    from modules import script_callbacks
+
+    script_callbacks.on_ui_tabs(on_ui_tabs)
+    print(
+        "[duplicate_model_finder] Registered via script_callbacks.on_ui_tabs() (Forge/A1111 path)",
+        flush=True,
+    )
+except ImportError:
+    # Standalone Python (tests) or vanilla A1111 with auto-discovery only -
+    # the module-level on_ui_tabs() above is the registration path.
+    print(
+        "[duplicate_model_finder] script_callbacks unavailable - "
+        "module-level on_ui_tabs() is the registration path",
+        flush=True,
+    )
