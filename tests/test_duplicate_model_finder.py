@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -469,16 +470,13 @@ def test_collect_hashes_parallel_skips_missing_file(tmp_path: Path):
 
 def test_purge_old_trash_removes_old_files(tmp_path, monkeypatch):
     """Files older than the retention window should be deleted from trash."""
-    monkeypatch.setattr(
-        "scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)]
-    )
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
     trash_dir = tmp_path / TRASH_DIR_NAME
     trash_dir.mkdir()
-    old_file = trash_dir / "old.ckpt"
+    disposed_at = datetime.now(timezone.utc) - timedelta(days=60)
+    old_file = trash_dir / f"{disposed_at:%Y%m%dT%H%M%S%f}_old.ckpt"
     old_file.write_text("old content")
-    # Set mtime to 60 days ago.
-    old_time = time.time() - (60 * 86400)
-    os.utime(old_file, (old_time, old_time))
+    # The model was modified recently; its disposal timestamp is 60 days old.
 
     message, deleted = purge_old_trash(retention_days=30)
 
@@ -489,14 +487,13 @@ def test_purge_old_trash_removes_old_files(tmp_path, monkeypatch):
 
 def test_purge_old_trash_keeps_young_files(tmp_path, monkeypatch):
     """Files within the retention window must remain untouched."""
-    monkeypatch.setattr(
-        "scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)]
-    )
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
     trash_dir = tmp_path / TRASH_DIR_NAME
     trash_dir.mkdir()
-    young_file = trash_dir / "young.ckpt"
+    young_file = trash_dir / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}_young.ckpt"
     young_file.write_text("young content")
-    # Default mtime is "now", well inside the 30-day window.
+    old_mtime = time.time() - (60 * 86400)
+    os.utime(young_file, (old_mtime, old_mtime))
 
     message, deleted = purge_old_trash(retention_days=30)
 
@@ -515,9 +512,7 @@ def test_purge_old_trash_negative_retention_rejected():
 
 def test_purge_old_trash_zero_retention_removes_everything(tmp_path, monkeypatch):
     """retention_days=0 is the explicit "purge now" knob."""
-    monkeypatch.setattr(
-        "scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)]
-    )
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
     trash_dir = tmp_path / TRASH_DIR_NAME
     trash_dir.mkdir()
     fresh = trash_dir / "fresh.ckpt"
@@ -531,9 +526,7 @@ def test_purge_old_trash_zero_retention_removes_everything(tmp_path, monkeypatch
 
 def test_purge_old_trash_handles_missing_model_dir(monkeypatch):
     """Non-existent MODEL_DIRS entries are skipped without raising."""
-    monkeypatch.setattr(
-        "scripts.duplicate_model_finder.MODEL_DIRS", ["/nonexistent/path/xyz"]
-    )
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", ["/nonexistent/path/xyz"])
 
     message, deleted = purge_old_trash(retention_days=30)
 
@@ -543,9 +536,7 @@ def test_purge_old_trash_handles_missing_model_dir(monkeypatch):
 
 def test_purge_old_trash_skips_subdirectories(tmp_path, monkeypatch):
     """Sub-directories inside trash must not be descended into or removed."""
-    monkeypatch.setattr(
-        "scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)]
-    )
+    monkeypatch.setattr("scripts.duplicate_model_finder.MODEL_DIRS", [str(tmp_path)])
     trash_dir = tmp_path / TRASH_DIR_NAME
     trash_dir.mkdir()
     nested = trash_dir / "nested_dir"
