@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
+from functools import wraps
 
 try:
     import gradio as gr
@@ -13,12 +14,6 @@ except ImportError:  # pragma: no cover - only triggered in test environments wi
     gr = None
 
 logger = logging.getLogger(__name__)
-
-# Diagnostic: bestaetigt im WebUI-Terminal dass das Script tatsaechlich geladen wurde.
-# Wichtig fuer reForge/Forge-Diagnose wenn der Tab nicht erscheint - ohne diesen Print
-# kann man nicht zwischen "Script nicht geladen" und "Script geladen, Tab nicht gemounted" unterscheiden.
-print(f"[duplicate_model_finder] MODULE LOADED pid={os.getpid()}", flush=True)
-
 
 MODEL_DIRS: list[str] = [
     os.path.join("models", "Stable-diffusion"),
@@ -34,20 +29,106 @@ DEFAULT_HASH_WORKERS = 8
 # Sibling directory used for soft-delete. The user can restore or permanently
 # delete files from there manually if needed.
 TRASH_DIR_NAME = ".duplicate_model_finder_trash"
-# Default retention window for ``purge_old_trash``: files older than this many
-# days are eligible for automatic deletion when ``TRASH_AUTO_EMPTY_DAYS`` is
-# set in the environment. The UI button always uses this default as well; the
-# env-var only controls *whether* auto-purge runs at scan-start.
+# Days since a file was moved to trash, not since its contents were modified.
 TRASH_RETENTION_DAYS = 30
-# Environment variable that opts the WebUI into automatic trash purging. When
-# set to an integer it enables auto-purge with that many days as retention;
-# when unset the UI button is the only path that can remove files from trash.
+# A positive integer opts in to automatic purge at UI scan start.
 TRASH_AUTO_EMPTY_DAYS_ENV = "TRASH_AUTO_EMPTY_DAYS"
-# NVMe-optimized hashing profile (issue #19 opt-in): 16 MB chunks + BLAKE2b.
-# Faster on NVMe + many-core CPUs at the cost of higher peak memory and a
-# non-standard hash that downstream tooling cannot reproduce. Off by default
-# so Cluster-1 callers (SHA256/1 MB/os.walk) stay unaffected.
+# Optional alternative profile; throughput depends on storage and CPU.
 NVME_CHUNK_SIZE = 16 * 1024 * 1024
+_operation_lock = threading.RLock()
+_ui_operation_lock = threading.Lock()
+
+
+def _serialized_operation(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with _operation_lock:
+            return function(*args, **kwargs)
+
+    return locked
+
+
+def _real_path(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def get_model_directories() -> list[str]:
+    """Resolve the running WebUI's roots; keep MODEL_DIRS as standalone fallback."""
+    try:
+        from modules import paths, shared
+    except ImportError:
+        directories = list(MODEL_DIRS)
+    else:
+        model_root = getattr(paths, "models_path", None)
+        directories = (
+            [os.path.join(model_root, category) for category in ("Stable-diffusion", "Lora", "VAE")]
+            if model_root
+            else list(MODEL_DIRS)
+        )
+        options = getattr(shared, "cmd_opts", None)
+        for name in ("ckpt_dir", "lora_dir", "vae_dir"):
+            configured = getattr(options, name, None)
+            if configured:
+                directories.append(configured)
+    unique: dict[str, str] = {}
+    for directory in directories:
+        absolute = os.path.abspath(directory)
+        unique.setdefault(_real_path(absolute), absolute)
+    return list(unique.values())
+
+
+def _inside_roots(path: str, roots: Sequence[str]) -> bool:
+    """Compare resolved paths, including junctions and Windows case folding."""
+    real = _real_path(path)
+    for root in roots:
+        resolved_root = _real_path(root)
+        try:
+            if real != resolved_root and os.path.commonpath([real, resolved_root]) == resolved_root:
+                return True
+        except ValueError:  # Different Windows drives.
+            continue
+    return False
+
+
+def _in_trash(path: str) -> bool:
+    # Check both the visible path and the target of directory/file links.
+    return any(
+        TRASH_DIR_NAME.casefold() in normalized.replace("\\", "/").casefold().split("/")
+        for normalized in (os.path.abspath(path), _real_path(path))
+    )
+
+
+def _safe_model_path(path: str, roots: Sequence[str]) -> bool:
+    return (
+        is_model_file(path)
+        and os.path.isfile(path)
+        and not os.path.islink(path)
+        and not _in_trash(path)
+        and _inside_roots(path, roots)
+    )
+
+
+def _file_identity(path: str):
+    """Also collapse hardlinks; some filesystems do not expose an inode."""
+    try:
+        info = os.stat(path)
+        if info.st_ino:
+            return info.st_dev, info.st_ino
+    except OSError:
+        pass
+    return _real_path(path)
+
+
+def duplicate_groups(hashes: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Keep only groups containing at least two different physical files."""
+    result = {}
+    for digest, paths in hashes.items():
+        unique = {}
+        for path in paths:
+            unique.setdefault(_file_identity(path), path)
+        if len(unique) > 1:
+            result[digest] = list(unique.values())
+    return result
 
 
 def is_model_file(file_name: str, extensions: Sequence[str] = ALLOWED_EXTENSIONS) -> bool:
@@ -67,13 +148,7 @@ def compute_hash(path: str, chunk_size: int = CHUNK_SIZE) -> str:
 
 
 def compute_hash_blake2b(path: str, chunk_size: int = NVME_CHUNK_SIZE) -> str:
-    """Compute the BLAKE2b hash of a file with a larger read chunk (issue #19 opt-in).
-
-    Faster than SHA256 on modern x86_64 (AVX2 path) and pairs with
-    ``iter_model_files_scandir`` for the NVMe-tuned scan profile. Returns the
-    same digest-length string as :func:`compute_hash` so callers can plug it
-    into the existing ``collect_hashes`` plumbing unchanged.
-    """
+    """Compute a 128-character BLAKE2b digest using larger read chunks."""
 
     hasher = hashlib.blake2b()
     with open(path, "rb") as file_handle:
@@ -85,13 +160,7 @@ def compute_hash_blake2b(path: str, chunk_size: int = NVME_CHUNK_SIZE) -> str:
 def _scandir_walk(
     directory: str, stop_event: threading.Event | None = None
 ) -> Iterable[tuple[str, list[str], list[str]]]:
-    """Yield ``(root, dirs, files)`` tuples using ``os.scandir`` for speed.
-
-    Mirror of :func:`os.walk` but built on top of :func:`os.scandir` so each
-    file stat (used implicitly via ``DirEntry.is_file``) avoids the second
-    syscall that ``os.path.getsize`` would trigger. Symlinks are followed via
-    the ``follow_symlinks=True`` argument of ``is_dir``/``is_file``.
-    """
+    """Iterative walk; callers can prune the mutable dirs list before descent."""
     pending: list[str] = [directory]
     while pending:
         current = pending.pop()
@@ -117,79 +186,69 @@ def _scandir_walk(
             pending.append(os.path.join(current, d))
 
 
-def iter_model_files_scandir(
-    directories: Sequence[str],
-    extensions: Sequence[str] = ALLOWED_EXTENSIONS,
-    stop_event: threading.Event | None = None,
-) -> Iterable[str]:
-    """Yield model file paths using ``os.scandir`` instead of ``os.walk``.
-
-    NVMe-tuned variant of :func:`iter_model_files`: each file's ``stat()``
-    call is avoided because the ``DirEntry`` already caches the stat info, so
-    we save one syscall per file vs. the default walker. Same dedup-via-
-    ``realpath`` contract, so callers can swap implementations without
-    touching downstream grouping logic.
-    """
-    ext_tuple = tuple(ext.lower() for ext in extensions)
-    seen: set[str] = set()
+def _walk_directories(directories, stop_event=None, *, prefer_nvme=False, include_trash=False):
+    """Prune cycles across roots and exclude trash, including aliases to it."""
+    visited = set()
     for directory in directories:
         if stop_event is not None and stop_event.is_set():
             return
         if not os.path.isdir(directory):
             continue
-        for root, dirs, files in _scandir_walk(directory, stop_event):
+        walker = (
+            _scandir_walk(directory, stop_event)
+            if prefer_nvme
+            else os.walk(directory, topdown=True, followlinks=True)
+        )
+        for root, dirs, files in walker:
             if stop_event is not None and stop_event.is_set():
                 return
-            for name in files:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                if not name.lower().endswith(ext_tuple):
-                    continue
-                path = os.path.join(root, name)
-                try:
-                    real = os.path.realpath(path)
-                except OSError:
-                    continue
-                if real in seen:
-                    continue
-                seen.add(real)
-                yield path
+            identity = _file_identity(root)
+            if identity in visited or (not include_trash and _in_trash(root)):
+                dirs.clear()
+                continue
+            visited.add(identity)
+            dirs[:] = [
+                name
+                for name in dirs
+                if _file_identity(os.path.join(root, name)) not in visited
+                and (include_trash or not _in_trash(os.path.join(root, name)))
+            ]
+            yield root, dirs, files
 
 
 def iter_model_files(
-    directories: Sequence[str],
+    directories: Sequence[str] | None = None,
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
     stop_event: threading.Event | None = None,
 ) -> Iterable[str]:
-    """Yield model file paths from the provided directories.
+    """Yield unique model files, following links without traversing cycles or trash."""
+    yield from _iter_model_files(directories, extensions, stop_event, prefer_nvme=False)
 
-    Symlinks are followed and only unique real files are yielded so that the
-    same physical file linked from multiple locations is reported once. When
-    ``stop_event`` is supplied the walk checks the flag between directories
-    and before each yielded path so a long-running scan can be cancelled
-    cooperatively.
-    """
 
-    ext_tuple = tuple(ext.lower() for ext in extensions)
-    seen: set[str] = set()
-    for directory in directories:
-        if stop_event is not None and stop_event.is_set():
-            return
-        if not os.path.isdir(directory):
-            continue
-        for root, _, files in os.walk(directory, followlinks=True):
+def iter_model_files_scandir(
+    directories: Sequence[str] | None = None,
+    extensions: Sequence[str] = ALLOWED_EXTENSIONS,
+    stop_event: threading.Event | None = None,
+) -> Iterable[str]:
+    """The iterative scandir variant with the same safety rules as the default."""
+    yield from _iter_model_files(directories, extensions, stop_event, prefer_nvme=True)
+
+
+def _iter_model_files(directories, extensions, stop_event, *, prefer_nvme):
+    roots = get_model_directories() if directories is None else directories
+    seen = set()
+    for root, _dirs, files in _walk_directories(roots, stop_event, prefer_nvme=prefer_nvme):
+        for name in files:
             if stop_event is not None and stop_event.is_set():
                 return
-            for name in files:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                if not name.lower().endswith(ext_tuple):
-                    continue
-                path = os.path.join(root, name)
-                real = os.path.realpath(path)
-                if real in seen:
-                    continue
-                seen.add(real)
+            if not is_model_file(name, extensions):
+                continue
+            path = os.path.join(root, name)
+            if _in_trash(path) or not os.path.isfile(path):
+                continue
+            identity = _file_identity(path)
+            if identity not in seen:
+                seen.add(identity)
                 yield path
 
 
@@ -292,6 +351,8 @@ def collect_hashes(
     workers = _resolve_worker_count(max_workers)
 
     def _hash_one(path: str) -> tuple[str, str] | None:
+        if stop_event is not None and stop_event.is_set():
+            return None
         try:
             return path, (compute_hash_blake2b(path) if prefer_nvme else compute_hash(path))
         except OSError:
@@ -314,8 +375,9 @@ def collect_hashes(
     return hashes
 
 
+@_serialized_operation
 def find_duplicates(
-    directories: Sequence[str] = MODEL_DIRS,
+    directories: Sequence[str] | None = None,
     extensions: Sequence[str] = ALLOWED_EXTENSIONS,
     *,
     use_size_prefilter: bool = True,
@@ -336,13 +398,14 @@ def find_duplicates(
 
     walker = iter_model_files_scandir if prefer_nvme else iter_model_files
     files = list(walker(directories, extensions, stop_event=stop_event))
-    return collect_hashes(
+    hashes = collect_hashes(
         files,
         use_size_prefilter=use_size_prefilter,
         max_workers=max_workers,
         stop_event=stop_event,
         prefer_nvme=prefer_nvme,
     )
+    return duplicate_groups(hashes)
 
 
 def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str, list[str]]:
@@ -350,7 +413,7 @@ def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str
 
     lines: list[str] = []
     choices: list[str] = []
-    for file_hash, paths in duplicates.items():
+    for file_hash, paths in duplicate_groups(duplicates).items():
         lines.append(f"Hash {file_hash}:")
         for path in paths:
             lines.append(f"  {path}")
@@ -359,41 +422,63 @@ def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str
     return text, choices
 
 
-def purge_old_trash(retention_days: int = TRASH_RETENTION_DAYS) -> tuple[str, int]:
-    """Delete files in any ``.duplicate_model_finder_trash/`` older than N days.
+def _trashed_at(name: str) -> float | None:
+    try:
+        timestamp, _original_name = name.split("_", 1)
+        return (
+            datetime.strptime(timestamp, "%Y%m%dT%H%M%S%f").replace(tzinfo=timezone.utc).timestamp()
+        )
+    except (ValueError, OverflowError, OSError):
+        return None
 
-    Scans every ``MODEL_DIRS`` tree for ``TRASH_DIR_NAME`` sub-directories and
-    removes files whose ``mtime`` is older than the cutoff. Returns a
-    human-readable status and the number of files removed.
+
+@_serialized_operation
+def purge_old_trash(
+    retention_days: int = TRASH_RETENTION_DAYS, *, allowed_roots: Sequence[str] | None = None
+) -> tuple[str, int]:
+    """Purge by disposal time. Zero explicitly empties regular files, even legacy names.
+
+    For positive retention, unknown names are preserved rather than guessing their age.
+    Directory/file links and locations outside the configured roots are never purged.
     """
-    if retention_days < 0:
-        return "Invalid retention_days: must be >= 0", 0
+    if not isinstance(retention_days, int) or not 0 <= retention_days <= 36500:
+        return "Invalid retention_days: must be an integer between 0 and 36500", 0
+    roots = get_model_directories() if allowed_roots is None else list(allowed_roots)
     cutoff = time.time() - (retention_days * 86400)
     deleted = 0
     trash_dirs_scanned = 0
-    for root_dir in MODEL_DIRS:
-        if not os.path.isdir(root_dir):
+    resolved_roots = {_real_path(root) for root in roots}
+    for current, dirs, _files in _walk_directories(roots, include_trash=True):
+        if _in_trash(current) or (
+            _real_path(current) not in resolved_roots and not _inside_roots(current, roots)
+        ):
+            dirs.clear()
             continue
-        for current, dirs, _files in os.walk(root_dir):
-            if TRASH_DIR_NAME in dirs:
-                trash_path = os.path.join(current, TRASH_DIR_NAME)
-                trash_dirs_scanned += 1
-                try:
-                    for entry in os.listdir(trash_path):
-                        entry_path = os.path.join(trash_path, entry)
-                        if not os.path.isfile(entry_path):
+        trash_path = os.path.join(_real_path(current), TRASH_DIR_NAME)
+        if TRASH_DIR_NAME in dirs and _plain_trash_directory(trash_path, roots):
+            trash_dirs_scanned += 1
+            try:
+                for entry in os.listdir(trash_path):
+                    entry_path = os.path.join(trash_path, entry)
+                    if os.path.islink(entry_path) or not os.path.isfile(entry_path):
+                        continue
+                    disposed = _trashed_at(entry)
+                    if retention_days != 0 and (disposed is None or disposed >= cutoff):
+                        continue
+                    try:
+                        # Recheck the directory immediately before deletion.
+                        if not _plain_trash_directory(trash_path, roots):
+                            break
+                        if not _inside_roots(entry_path, roots) or os.path.islink(entry_path):
                             continue
-                        try:
-                            if os.path.getmtime(entry_path) < cutoff:
-                                os.unlink(entry_path)
-                                deleted += 1
-                                logger.info("Purged trash file: %s", entry_path)
-                        except OSError as exc:
-                            logger.error("Cannot purge %s: %s", entry_path, exc)
-                except OSError as exc:
-                    logger.error("Cannot list trash dir %s: %s", trash_path, exc)
-                # Don't descend into the trash dir for further walking.
-                dirs.remove(TRASH_DIR_NAME)
+                        os.unlink(entry_path)
+                        deleted += 1
+                        logger.info("Purged trash file: %s", entry_path)
+                    except OSError as exc:
+                        logger.error("Cannot purge %s: %s", entry_path, exc)
+            except OSError as exc:
+                logger.error("Cannot list trash dir %s: %s", trash_path, exc)
+        dirs[:] = [name for name in dirs if not _in_trash(os.path.join(current, name))]
     return (
         f"Purged {deleted} file(s) older than {retention_days} day(s) "
         f"from {trash_dirs_scanned} trash dir(s)",
@@ -401,7 +486,32 @@ def purge_old_trash(retention_days: int = TRASH_RETENTION_DAYS) -> tuple[str, in
     )
 
 
-def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
+def auto_purge_trash(roots: Sequence[str]) -> str:
+    configured = os.environ.get(TRASH_AUTO_EMPTY_DAYS_ENV)
+    if configured is None:
+        return ""
+    try:
+        days = int(configured)
+        if not 1 <= days <= 36500:
+            raise ValueError
+    except ValueError:
+        return f"Automatic trash cleanup skipped: {TRASH_AUTO_EMPTY_DAYS_ENV} must be 1–36500"
+    return purge_old_trash(days, allowed_roots=roots)[0]
+
+
+def _plain_trash_directory(path: str, roots: Sequence[str]) -> bool:
+    return (
+        not os.path.islink(path)
+        and _real_path(path) == os.path.normcase(os.path.abspath(path))
+        and _inside_roots(path, roots)
+        and (not os.path.lexists(path) or os.path.isdir(path))
+    )
+
+
+@_serialized_operation
+def move_files_to_trash(
+    paths: Sequence[str], *, allowed_roots: Sequence[str] | None = None
+) -> tuple[str, list[str]]:
     """Move files into a sibling ``.duplicate_model_finder_trash/`` directory.
 
     This is the default safe workflow. Files remain on disk inside the trash
@@ -416,10 +526,17 @@ def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
     if not paths:
         return "No files moved", []
 
+    roots = get_model_directories() if allowed_roots is None else list(allowed_roots)
     moved: list[str] = []
     failed: list[str] = []
     for path in paths:
         path_str = str(path)
+        if not _safe_model_path(path_str, roots):
+            logger.warning(
+                "Refusing non-model, missing, linked, external or trashed path: %s", path_str
+            )
+            failed.append(path_str)
+            continue
         if not os.path.exists(path_str):
             logger.warning("Skipping %s: file does not exist", path_str)
             failed.append(path_str)
@@ -428,8 +545,13 @@ def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
             logger.warning("No write permission for %s — cannot move", path_str)
             failed.append(path_str)
             continue
-        parent = os.path.dirname(os.path.abspath(path_str)) or "."
+        source = _real_path(path_str)
+        parent = os.path.dirname(source)
         trash_dir = os.path.join(parent, TRASH_DIR_NAME)
+        if not _plain_trash_directory(trash_dir, roots):
+            logger.warning("Refusing redirected trash directory: %s", trash_dir)
+            failed.append(path_str)
+            continue
         try:
             os.makedirs(trash_dir, exist_ok=True)
         except OSError as exc:
@@ -441,12 +563,15 @@ def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
         staged_name = f"{timestamp}_{base}"
         staged_path = os.path.join(trash_dir, staged_name)
         counter = 1
-        while os.path.exists(staged_path):
+        while os.path.lexists(staged_path):
             staged_name = f"{timestamp}_{counter}_{base}"
             staged_path = os.path.join(trash_dir, staged_name)
             counter += 1
         try:
-            os.rename(path_str, staged_path)
+            if not _safe_model_path(source, roots) or not _plain_trash_directory(trash_dir, roots):
+                failed.append(path_str)
+                continue
+            os.rename(source, staged_path)
             moved.append(path_str)
             logger.info("Moved to trash: %s -> %s", path_str, staged_path)
         except OSError as exc:
@@ -462,9 +587,12 @@ def move_files_to_trash(paths: Sequence[str]) -> tuple[str, list[str]]:
     return message, failed
 
 
+@_serialized_operation
 def permanently_delete_files(
     paths: Sequence[str],
     confirm: bool = False,
+    *,
+    allowed_roots: Sequence[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Permanently delete files. Requires explicit ``confirm=True``.
 
@@ -486,16 +614,27 @@ def permanently_delete_files(
     if not paths:
         return "No files deleted", []
 
+    roots = get_model_directories() if allowed_roots is None else list(allowed_roots)
     removed: list[str] = []
     failed: list[str] = []
     for path in paths:
         path_str = str(path)
+        if not _safe_model_path(path_str, roots):
+            logger.warning(
+                "Refusing non-model, missing, linked, external or trashed path: %s", path_str
+            )
+            failed.append(path_str)
+            continue
         if not os.access(path_str, os.W_OK):
             logger.warning("No write permission for %s — cannot delete", path_str)
             failed.append(path_str)
             continue
         try:
-            os.remove(path_str)
+            source = _real_path(path_str)
+            if not _safe_model_path(source, roots):
+                failed.append(path_str)
+                continue
+            os.remove(source)
             removed.append(path_str)
             logger.info("Permanently deleted %s", path_str)
         except OSError as exc:
@@ -509,7 +648,9 @@ def permanently_delete_files(
     return "No files deleted", failed
 
 
-def delete_files(paths: Sequence[str]) -> tuple[str, list[str]]:
+def delete_files(
+    paths: Sequence[str], *, allowed_roots: Sequence[str] | None = None
+) -> tuple[str, list[str]]:
     """Deprecated: kept for backward compatibility, now routes to move_files_to_trash().
 
     Use :func:`move_files_to_trash` or
@@ -518,7 +659,7 @@ def delete_files(paths: Sequence[str]) -> tuple[str, list[str]]:
     """
 
     logger.debug("delete_files() called — redirecting to move_files_to_trash()")
-    return move_files_to_trash(paths)
+    return move_files_to_trash(paths, allowed_roots=allowed_roots)
 
 
 # Guard flag: prevents double-mount if both A1111's auto-discovery AND
@@ -539,7 +680,6 @@ def on_ui_tabs():
             flush=True,
         )
         return []
-    _ui_tab_mounted = True
     print("[duplicate_model_finder] on_ui_tabs() CALLED", flush=True)
     if gr is None:  # pragma: no cover - safety net for environments ohne Gradio
         raise ImportError("Gradio ist nicht installiert und wird für die UI benötigt.")
@@ -555,7 +695,7 @@ def on_ui_tabs():
 
         with gr.Row():
             scan_btn = gr.Button(value="Scan for duplicates")
-            select_all_btn = gr.Button(value="Select all")
+            select_all_btn = gr.Button(value="Select extra copies")
             cancel_btn = gr.Button(value="Cancel scan")
             trash_btn = gr.Button(value="Move selected to trash")
             delete_btn = gr.Button(value="Permanently delete selected")
@@ -571,98 +711,157 @@ def on_ui_tabs():
         # created with a ``choices`` parameter in order to modify it later via
         # ``gr.update`` (fix from PR #3, commit 0efaead).
         delete_choices = gr.CheckboxGroup(label="Select files to handle", choices=[])
-        # Holds the current choice list so the ``select_all_btn`` knows which
-        # paths belong to the last scan. Updated by ``do_scan`` after every
-        # run (restores the helper from PR #3 / commit 1b10314 that was
-        # skipped during the PR #13 rebase; closes #18).
-        choices_state = gr.State([])
+        # Server-side groups and roots validate checkbox submissions.
+        choices_state = gr.State({"groups": {}, "roots": []})
+        gr.Markdown(
+            "Linked models outside the configured model folders are shown but protected from deletion."
+        )
         confirm_check = gr.Checkbox(
-            label=("Yes, I really want to permanently delete the selected files " "(irreversible)"),
+            label=("Yes, I really want to permanently delete the selected files (irreversible)"),
             value=False,
         )
         empty_trash_confirm = gr.Checkbox(
-            label=("Yes, empty the entire trash (irreversible, all model file(s) "
-                   "in .duplicate_model_finder_trash/ older than the retention window)"),
+            label=(
+                "Yes, empty the entire trash (irreversible, all model file(s) "
+                "in .duplicate_model_finder_trash/ older than the retention window)"
+            ),
             value=False,
         )
         nvme_check = gr.Checkbox(
-            label=("Aggressive scan (NVMe-optimized, BLAKE2b + 16 MB chunks, "
-                   "opt-in feature flag from issue #19)"),
+            label=(
+                "Aggressive scan (NVMe-optimized, BLAKE2b + 16 MB chunks, "
+                "opt-in feature flag from issue #19)"
+            ),
             value=False,
         )
         result_box = gr.Textbox(label="Status", interactive=False)
 
-        def do_scan(progress=gr.Progress(), prefer_nvme: bool = False):
-            """Run the duplicate scan with progressive UI updates (closes #6).
-
-            Implemented as a generator so Gradio can refresh the UI between
-            the file-walk and the hashing phases. ``gr.Progress()`` is the
-            default-argument form Gradio injects at runtime; it renders as a
-            non-blocking progress indicator and keeps the WebUI responsive
-            while ``find_duplicates`` walks the model directories.
-
-            When ``prefer_nvme`` is set the NVMe-tuned profile is used:
-            ``iter_model_files_scandir`` + BLAKE2b hashing (closes #19 opt-in).
-            """
-            stop_event.clear()
-            progress(0, desc="Starting scan…")
-            yield (
-                "Scanning…",
-                gr.update(choices=[], value=[]),
-                f"Scanning {len(MODEL_DIRS)} root dir(s)…",
+        def view(groups, roots, status, selected=()):
+            groups = duplicate_groups(groups)
+            text, _paths = format_duplicates_for_display(groups)
+            choices = [
+                path for paths in groups.values() for path in paths if _safe_model_path(path, roots)
+            ]
+            return (
+                text,
+                gr.update(choices=choices, value=[path for path in selected if path in choices]),
+                {"groups": groups, "roots": list(roots)},
+                status,
             )
-            walker = iter_model_files_scandir if prefer_nvme else iter_model_files
-            files = list(walker(MODEL_DIRS, stop_event=stop_event))
-            if stop_event.is_set():
-                progress(1.0, desc="Cancelled")
-                yield (
-                    "Scan cancelled",
-                    gr.update(choices=[], value=[]),
-                    "Cancelled before hashing",
-                )
+
+        def do_scan(prefer_nvme: bool = False, progress=gr.Progress()):
+            """Every progress event, including the final result, has four outputs."""
+            if not _ui_operation_lock.acquire(blocking=False):
+                yield view({}, get_model_directories(), "Another scan or file operation is running")
                 return
-            progress(0.2, desc=f"Found {len(files)} model file(s); hashing…")
-            yield (
-                f"Found {len(files)} model file(s); computing hashes…",
-                gr.update(choices=[], value=[]),
-                f"Hashing {len(files)} file(s)…",
-            )
-            duplicates = collect_hashes(files, stop_event=stop_event, prefer_nvme=prefer_nvme)
-            text, choices = format_duplicates_for_display(duplicates)
-            progress(1.0, desc="Done")
-            profile_note = " (NVMe-tuned)" if prefer_nvme else ""
-            status = (
-                "Scan cancelled"
-                if stop_event.is_set()
-                else f"Scan complete{profile_note} — {len(duplicates)} hash group(s)"
-            )
-            # Third return value pushes the freshly computed choices into
-            # ``choices_state`` so the select-all button can act on them.
-            return text, gr.update(choices=choices, value=[]), choices, status
+            try:
+                stop_event.clear()
+                roots = get_model_directories()
+                cleanup = auto_purge_trash(roots)
+                progress(0, desc="Starting scan…")
+                yield view({}, roots, f"Scanning {len(roots)} model folder(s)… {cleanup}".strip())
+                walker = iter_model_files_scandir if prefer_nvme else iter_model_files
+                files = list(walker(roots, stop_event=stop_event))
+                if stop_event.is_set():
+                    progress(1.0, desc="Cancelled")
+                    yield view({}, roots, "Scan cancelled before hashing")
+                    return
+                progress(0.2, desc=f"Found {len(files)} model file(s); hashing…")
+                yield view({}, roots, f"Hashing {len(files)} model file(s)…")
+                hashes = collect_hashes(files, stop_event=stop_event, prefer_nvme=prefer_nvme)
+                if stop_event.is_set():
+                    progress(1.0, desc="Cancelled")
+                    yield view({}, roots, "Scan cancelled during hashing")
+                    return
+                groups = duplicate_groups(hashes)
+                progress(1.0, desc="Done")
+                profile = " (NVMe profile)" if prefer_nvme else ""
+                yield view(
+                    groups, roots, f"Scan complete{profile}: {len(groups)} duplicate group(s)"
+                )
+            finally:
+                _ui_operation_lock.release()
 
-        def select_all_choices(choices: list[str]) -> list[str]:
-            """Return the full choice list to mark every entry as selected."""
-            return list(choices)
+        def select_extra_copies(snapshot):
+            """Bulk-select duplicates while retaining one physical copy per group."""
+            snapshot = snapshot or {"groups": {}, "roots": []}
+            selected = []
+            for paths in snapshot["groups"].values():
+                protected = [
+                    path for path in paths if not _safe_model_path(path, snapshot["roots"])
+                ]
+                survivor = protected[0] if protected else paths[0]
+                selected.extend(
+                    path
+                    for path in paths
+                    if path != survivor and _safe_model_path(path, snapshot["roots"])
+                )
+            return selected
 
-        def do_trash(selected: list[str]):
-            status, failed = move_files_to_trash(selected)
-            if failed:
-                # Keep the failed entries selected so users can retry.
-                return gr.update(value=failed), status
-            return gr.update(value=[]), status
+        def handle_selection(selected, snapshot, *, permanent=False, confirm=False):
+            snapshot = snapshot or {"groups": {}, "roots": []}
+            selected = selected or []
+            if not _ui_operation_lock.acquire(blocking=False):
+                return view(
+                    snapshot["groups"],
+                    snapshot["roots"],
+                    "A scan or file operation is running",
+                    selected,
+                )
+            try:
+                roots = snapshot["roots"]
+                groups = snapshot["groups"]
+                eligible = {
+                    path
+                    for paths in groups.values()
+                    for path in paths
+                    if _safe_model_path(path, roots)
+                }
+                if not selected:
+                    return view(groups, roots, "Select an extra copy first")
+                if any(path not in eligible for path in selected):
+                    return view(groups, roots, "Selection changed; scan again before deleting")
+                selected_set = set(selected)
+                for paths in groups.values():
+                    existing = {path for path in paths if os.path.isfile(path)}
+                    if existing and existing.issubset(selected_set):
+                        return view(groups, roots, "Keep at least one copy of each model", selected)
+                if permanent and not confirm:
+                    return view(groups, roots, "Permanent deletion requires confirmation", selected)
+                if permanent:
+                    status, failed = permanently_delete_files(
+                        selected, confirm=True, allowed_roots=roots
+                    )
+                else:
+                    status, failed = move_files_to_trash(selected, allowed_roots=roots)
+                remaining = duplicate_groups(
+                    {
+                        digest: [
+                            path for path in paths if os.path.isfile(path) and not _in_trash(path)
+                        ]
+                        for digest, paths in groups.items()
+                    }
+                )
+                return view(remaining, roots, status, failed)
+            finally:
+                _ui_operation_lock.release()
 
-        def do_delete(selected: list[str], confirm: bool):
-            status, failed = permanently_delete_files(selected, confirm=confirm)
-            if failed:
-                # Keep the failed entries selected so users can retry.
-                return gr.update(value=failed), status
-            return gr.update(value=[]), status
+        def do_trash(selected, snapshot):
+            return handle_selection(selected, snapshot)
+
+        def do_delete(selected, snapshot, confirm):
+            return handle_selection(selected, snapshot, permanent=True, confirm=confirm)
 
         def do_empty_trash(confirm: bool):
             """Permanently delete all trash files older than the retention window."""
             if not confirm:
                 return "Empty-trash cancelled: confirmation required"
-            return purge_old_trash()[0]
+            if not _ui_operation_lock.acquire(blocking=False):
+                return "A scan or file operation is running"
+            try:
+                return purge_old_trash()[0]
+            finally:
+                _ui_operation_lock.release()
 
         def cancel_scan():
             """Request the running scan to stop."""
@@ -675,16 +874,20 @@ def on_ui_tabs():
             outputs=[duplicates_box, delete_choices, choices_state, result_box],
         )
         select_all_btn.click(
-            fn=select_all_choices,
+            fn=select_extra_copies,
             inputs=choices_state,
             outputs=delete_choices,
         )
         cancel_btn.click(fn=cancel_scan, outputs=result_box)
-        trash_btn.click(fn=do_trash, inputs=delete_choices, outputs=[delete_choices, result_box])
+        trash_btn.click(
+            fn=do_trash,
+            inputs=[delete_choices, choices_state],
+            outputs=[duplicates_box, delete_choices, choices_state, result_box],
+        )
         delete_btn.click(
             fn=do_delete,
-            inputs=[delete_choices, confirm_check],
-            outputs=[delete_choices, result_box],
+            inputs=[delete_choices, choices_state, confirm_check],
+            outputs=[duplicates_box, delete_choices, choices_state, result_box],
         )
         empty_trash_btn.click(
             fn=do_empty_trash,
@@ -692,6 +895,7 @@ def on_ui_tabs():
             outputs=result_box,
         )
 
+    _ui_tab_mounted = True
     result = [(ui, "Duplicate Models", "duplicate_model_finder")]
     print(f"[duplicate_model_finder] on_ui_tabs() RETURNING {len(result)} tab(s)", flush=True)
     return result
