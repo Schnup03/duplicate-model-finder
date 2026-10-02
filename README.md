@@ -32,15 +32,36 @@ Wer die Aufbewahrungsfrist für eine automatische Bereinigung beim Scan festlege
 ## Python-Schnittstelle
 
 ```python
-from scripts.duplicate_model_finder import find_duplicates, move_files_to_trash
+from scripts.duplicate_model_finder import (
+    detect_bundle_members,
+    find_duplicates,
+    move_files_to_trash,
+)
 
 groups = find_duplicates()  # {"<sha256>": [".../a.ckpt", ".../copy.ckpt"]}
-status, failed = move_files_to_trash(["models/Stable-diffusion/copy.ckpt"])
+
+# `groups` mitgeben, damit nie die letzte Kopie einer Gruppe wegschwindet.
+status, failed = move_files_to_trash(["models/Stable-diffusion/copy.ckpt"], groups=groups)
+
+# Begleitdateien (Metadaten, Previews) eines Modells:
+detect_bundle_members("models/Stable-diffusion/a.safetensors")
 ```
 
 `find_duplicates` akzeptiert optional `directories`, `extensions`, `use_size_prefilter`, `max_workers`, `stop_event` und `prefer_nvme`. Standardmäßig überspringt die Größenfilterung Dateien, deren Größe einzigartig ist; gleiche Größen allein gelten **nicht** als Duplikat. Die alternative Scanoption verwendet BLAKE2b mit größeren Lese-Blöcken; ihre Hashwerte sind nicht mit den normalen SHA256-Werten austauschbar.
 
 Die Funktionen `move_files_to_trash`, `permanently_delete_files` und `purge_old_trash` nehmen für eigenständige Skripte optional `allowed_roots=[...]` an. Ohne diese Angabe gelten die aktiven WebUI-Modellordner beziehungsweise außerhalb der WebUI die Standardordner. Die endgültige Löschung verlangt zusätzlich `confirm=True`. Dateiverknüpfungen, Ordner außerhalb der erlaubten Wurzeln und Papierkorbdateien werden von den normalen Löschfunktionen abgewiesen.
+
+### Letzte Kopie schützen
+
+`move_files_to_trash` und `permanently_delete_files` nehmen zusätzlich `groups` entgegen — die Rückgabe von `find_duplicates`. Ist der Parameter gesetzt, lehnen beide Funktionen den Auftrag ab, wenn er **alle** noch vorhandenen Kopien einer Gruppe betrifft. Ohne `groups` (oder mit `groups=None`) gilt der Schutz als bewusst übergangen, und es wird genau das ausgeführt, was übergeben wurde. Die WebUI übergibt `groups` immer.
+
+### Modell-Bundles (Begleitdateien)
+
+`detect_bundle_members(modellpfad)` liefert die Begleitdateien, die zu einem Modell gehören: gleiches Verzeichnis, Namenspräfix gleich einem Stamm des Modells und eine der Extensions `.civitai.info`, `.info`, `.json`, `.html`, `.yaml`, `.yml`, `.png`, `.jpg`, `.jpeg`, `.webp`. Doppel-Endungen wie `model.safetensors.json` zählen mit. Nicht zugehörige Dateien im selben Ordner (`README.md`, andere Modelle) werden bewusst nicht erfasst, Unterverzeichnisse ebensowenig, und symbolisch verlinkte Begleitdateien werden übersprungen.
+
+`total_bundle_size(modellpfad)` liefert die Summe aus Modell und erkannten Begleitdateien in Byte.
+
+Im Tab werden Begleitdateien **nur lesend** unter dem jeweiligen Modell angezeigt. Sie stehen nie in der Lösch-Auswahl und werden von keiner Löschfunktion erfasst — wer ein Modell verschiebt, verschiebt seine Begleitdateien also nicht automatisch mit.
 
 ## Tests
 
@@ -53,7 +74,7 @@ Die CI prüft Python 3.10–3.12 unter Linux, Python 3.12 unter Windows mit echt
 
 ## Grenzen
 
-Diese Erweiterung sucht und bereinigt Duplikate. Eine NVMe-/Archiv-Verwaltung, Laufwerk-übergreifende Modellverschiebungen und Adapter für weitere Programme sind derzeit nicht enthalten. Über Verzeichnisverknüpfungen werden externe Modelle nur lesend in der Trefferliste gezeigt.
+Diese Erweiterung sucht und bereinigt Duplikate und erkennt die Begleitdateien eines Modells. Nicht enthalten sind: eine NVMe-/Archiv-Verwaltung, laufwerk-übergreifende Modellverschiebungen (Begleitdateien wandern beim Verschieben eines Modells nicht automatisch mit) und Adapter für weitere Programme. Über Verzeichnisverknüpfungen werden externe Modelle nur lesend in der Trefferliste gezeigt.
 
 ## Lizenz
 

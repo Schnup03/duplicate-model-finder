@@ -137,6 +137,94 @@ def is_model_file(file_name: str, extensions: Sequence[str] = ALLOWED_EXTENSIONS
     return file_name.lower().endswith(tuple(ext.lower() for ext in extensions))
 
 
+# Companion files that belong to a model bundle: metadata, previews and
+# configs that travel with the weight file. Everything else in the folder
+# (README.md, unrelated checkpoints, …) is deliberately not matched.
+COMPANION_DOUBLE_EXTS: frozenset[str] = frozenset({".civitai.info", ".info"})
+COMPANION_SINGLE_EXTS: frozenset[str] = frozenset(
+    {".json", ".html", ".yaml", ".yml", ".png", ".jpg", ".jpeg", ".webp"}
+)
+
+
+def _path_suffixes(path: str) -> tuple[str, ...]:
+    """All suffixes of a path, lowercased, in order.
+
+    ``model.safetensors`` -> ``('.safetensors',)``,
+    ``model.safetensors.json`` -> ``('.safetensors', '.json')``.
+    """
+
+    name = os.path.basename(path)
+    return tuple("." + part.lower() for part in name.split(".")[1:] if part)
+
+
+def _is_companion(name: str) -> bool:
+    """True when the file name carries an allowed companion extension."""
+
+    suffixes = _path_suffixes(name)
+    if not suffixes:
+        return False
+    if len(suffixes) >= 2 and (suffixes[-2] + suffixes[-1]) in COMPANION_DOUBLE_EXTS:
+        return True
+    return suffixes[-1] in COMPANION_SINGLE_EXTS
+
+
+def _bundle_stems(name: str) -> list[str]:
+    """Every meaningful stem prefix of a file name.
+
+    ``model.safetensors`` -> ``['model']``,
+    ``model.safetensors.json`` -> ``['model.safetensors', 'model']``.
+    """
+
+    parts = name.split(".")
+    return [".".join(parts[:index]) for index in range(1, len(parts)) if parts[:index]]
+
+
+def detect_bundle_members(model_path: str) -> list[str]:
+    """Return the companion files that belong to ``model_path``.
+
+    Companions are siblings in the same directory whose name starts with one
+    of the model's stems and whose extension is a known companion extension.
+    ``model.safetensors`` does not appear in the result. A missing or
+    non-file path yields an empty list.
+    """
+
+    if not os.path.isfile(model_path):
+        return []
+    parent = os.path.dirname(os.path.abspath(model_path))
+    if not os.path.isdir(parent):
+        return []
+    stems = _bundle_stems(os.path.basename(model_path))
+    if not stems:
+        return []
+    found: list[str] = []
+    try:
+        entries = sorted(os.listdir(parent))
+    except OSError:
+        return []
+    base = os.path.basename(model_path)
+    for entry in entries:
+        if entry == base or not entry.startswith(tuple(f"{stem}." for stem in stems)):
+            continue
+        candidate = os.path.join(parent, entry)
+        if _is_companion(entry) and os.path.isfile(candidate) and not os.path.islink(candidate):
+            found.append(candidate)
+    return found
+
+
+def total_bundle_size(model_path: str) -> int:
+    """Total bytes of a model plus its detected companions (0 if missing)."""
+
+    if not os.path.isfile(model_path):
+        return 0
+    total = os.path.getsize(model_path)
+    for companion in detect_bundle_members(model_path):
+        try:
+            total += os.path.getsize(companion)
+        except OSError:
+            continue
+    return total
+
+
 def compute_hash(path: str, chunk_size: int = CHUNK_SIZE) -> str:
     """Compute the SHA256 hash of a file in chunks to limit memory usage."""
 
@@ -409,7 +497,12 @@ def find_duplicates(
 
 
 def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str, list[str]]:
-    """Prepare human-readable text and selection choices for the UI."""
+    """Prepare human-readable text and selection choices for the UI.
+
+    Companion files (metadata, previews) are listed read-only under their
+    model so the user can see what would be left orphaned. They are never
+    part of the returned choices and therefore never deletable.
+    """
 
     lines: list[str] = []
     choices: list[str] = []
@@ -417,6 +510,10 @@ def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str
         lines.append(f"Hash {file_hash}:")
         for path in paths:
             lines.append(f"  {path}")
+            companions = detect_bundle_members(path)
+            if companions:
+                lines.append(f"    companions ({len(companions)}):")
+                lines.extend(f"      {name}" for name in companions)
             choices.append(path)
     text = "\n".join(lines) if lines else "No duplicates found"
     return text, choices
@@ -508,9 +605,31 @@ def _plain_trash_directory(path: str, roots: Sequence[str]) -> bool:
     )
 
 
+def _would_remove_last_copy(paths: Sequence[str], groups: dict[str, list[str]] | None) -> bool:
+    """True when removing ``paths`` would wipe out a whole duplicate group.
+
+    A group is only endangered when it currently has files on disk and *all*
+    of them are part of the request. Groups whose files are already gone do
+    not block anything, and a missing/empty group map means the caller opted
+    out of the check.
+    """
+
+    if not groups:
+        return False
+    requested = {str(path) for path in paths}
+    for group_paths in groups.values():
+        existing = {path for path in group_paths if os.path.isfile(path)}
+        if existing and existing.issubset(requested):
+            return True
+    return False
+
+
 @_serialized_operation
 def move_files_to_trash(
-    paths: Sequence[str], *, allowed_roots: Sequence[str] | None = None
+    paths: Sequence[str],
+    *,
+    allowed_roots: Sequence[str] | None = None,
+    groups: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[str]]:
     """Move files into a sibling ``.duplicate_model_finder_trash/`` directory.
 
@@ -520,11 +639,19 @@ def move_files_to_trash(
     files without write permission are skipped and reported in the failure
     list rather than aborting the whole batch.
 
+    ``groups`` is the mapping returned by :func:`find_duplicates`. Pass it to
+    keep the last copy of every duplicate group alive; without it the function
+    moves exactly what it is given. The UI always supplies it.
+
     Returns ``(status_message, list_of_paths_that_failed)``.
     """
 
     if not paths:
         return "No files moved", []
+
+    if _would_remove_last_copy(paths, groups):
+        logger.warning("Refused to move every copy of a duplicate group: %s", list(paths))
+        return "Keeping at least one copy of each model", [str(path) for path in paths]
 
     roots = get_model_directories() if allowed_roots is None else list(allowed_roots)
     moved: list[str] = []
@@ -593,6 +720,7 @@ def permanently_delete_files(
     confirm: bool = False,
     *,
     allowed_roots: Sequence[str] | None = None,
+    groups: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[str]]:
     """Permanently delete files. Requires explicit ``confirm=True``.
 
@@ -600,6 +728,10 @@ def permanently_delete_files(
     function is the irreversible escape hatch and is intentionally hostile
     to silent misuse: passing ``confirm=False`` (the default) returns all
     paths as failed and emits a warning.
+
+    ``groups`` behaves exactly as in :func:`move_files_to_trash`: pass the
+    mapping from :func:`find_duplicates` to keep the last copy of every
+    duplicate group alive.
 
     Returns ``(status_message, list_of_paths_that_failed)``.
     """
@@ -613,6 +745,10 @@ def permanently_delete_files(
 
     if not paths:
         return "No files deleted", []
+
+    if _would_remove_last_copy(paths, groups):
+        logger.warning("Refused to delete every copy of a duplicate group: %s", list(paths))
+        return "Keeping at least one copy of each model", [str(path) for path in paths]
 
     roots = get_model_directories() if allowed_roots is None else list(allowed_roots)
     removed: list[str] = []
@@ -830,10 +966,12 @@ def on_ui_tabs():
                     return view(groups, roots, "Permanent deletion requires confirmation", selected)
                 if permanent:
                     status, failed = permanently_delete_files(
-                        selected, confirm=True, allowed_roots=roots
+                        selected, confirm=True, allowed_roots=roots, groups=groups
                     )
                 else:
-                    status, failed = move_files_to_trash(selected, allowed_roots=roots)
+                    status, failed = move_files_to_trash(
+                        selected, allowed_roots=roots, groups=groups
+                    )
                 remaining = duplicate_groups(
                     {
                         digest: [
