@@ -13,7 +13,9 @@ from typing import Any
 # helpers and for the test suite, even where no WebUI environment exists.
 gr: Any
 try:
-    import gradio as gr
+    import gradio
+
+    gr = gradio
 except ImportError:  # pragma: no cover - only triggered in test environments without Gradio
     gr = None
 
