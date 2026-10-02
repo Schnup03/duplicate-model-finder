@@ -82,5 +82,11 @@ addopts = [
 ]
 filterwarnings = [
   "error",
+  # Third-party deprecations must not fail our suite: `error` above is meant
+  # for our own warnings, not for FastAPI/Starlette internals that Gradio
+  # 3.41.2 still triggers while building its app (e.g. `on_event`).
   "ignore::DeprecationWarning:gradio.*",
+  "ignore::DeprecationWarning:fastapi.*",
+  "ignore::DeprecationWarning:starlette.*",
+  "ignore:.*on_event is deprecated.*:DeprecationWarning",
 ]

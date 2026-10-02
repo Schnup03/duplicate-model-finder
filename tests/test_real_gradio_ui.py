@@ -1,10 +1,23 @@
-"""Run in CI with the Gradio version used by AUTOMATIC1111."""
+"""Run in CI with the Gradio version used by AUTOMATIC1111.
+
+The callback wiring asserted here is Gradio 3.x specific (``tab.fns`` holds
+Block objects with ``validate_outputs``). A1111 / Forge pin Gradio 3.x, so
+that is the contract worth testing; on Gradio 4+ these tests skip instead of
+reporting a false failure.
+"""
 
 import pytest
 
 from scripts import duplicate_model_finder as dmf
 
 gr = pytest.importorskip("gradio")
+
+if int(gr.__version__.split(".", 1)[0]) >= 4:
+    pytest.skip(
+        f"Gradio {gr.__version__} does not expose the Gradio 3.x callback API "
+        "this module tests; CI pins gradio==3.41.2.",
+        allow_module_level=True,
+    )
 
 
 def test_registered_gradio_scan_accepts_all_progress_outputs(tmp_path, monkeypatch):
