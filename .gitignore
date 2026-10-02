@@ -1,3 +1,12 @@
 __pycache__/
 *.pyc
 .env
+.pytest_cache/
+.ruff_cache/
+.benchmarks/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
