@@ -79,6 +79,36 @@ class TestDetectBundleMembers:
         os.symlink(outside, model_dir / "my_model.json")
         assert dmf.detect_bundle_members(str(m)) == []
 
+    def test_shared_stem_chain_is_reported_under_both_models(self, model_dir):
+        # `foo` is a stem of both models, so `foo.bar.json` genuinely cannot be
+        # attributed to one of them from the file names alone. Documented
+        # behaviour, not a bug: the listing is read-only and never deletable.
+        short = _touch(model_dir / "foo.ckpt", b"a")
+        long = _touch(model_dir / "foo.bar.safetensors", b"b")
+        _touch(model_dir / "foo.bar.json", b"{}")
+        _touch(model_dir / "foo.json", b"{}")
+        from_short = {os.path.basename(p) for p in dmf.detect_bundle_members(str(short))}
+        from_long = {os.path.basename(p) for p in dmf.detect_bundle_members(str(long))}
+        assert from_short == {"foo.json", "foo.bar.json"}
+        assert from_long == {"foo.json", "foo.bar.json"}
+
+    def test_directory_listing_is_read_once_per_folder(self, model_dir, monkeypatch):
+        # Guards the quadratic-scan regression: the display path used to call
+        # os.listdir once per model instead of once per directory.
+        for index in range(20):
+            _touch(model_dir / f"m{index}.ckpt", b"same")
+        groups = {"h1": [str(model_dir / f"m{index}.ckpt") for index in range(20)]}
+        calls = []
+        real_listdir = os.listdir
+
+        def counting_listdir(path):
+            calls.append(path)
+            return real_listdir(path)
+
+        monkeypatch.setattr(dmf.os, "listdir", counting_listdir)
+        dmf.format_duplicates_for_display(groups)
+        assert calls.count(str(model_dir)) <= 1
+
     def test_output_is_sorted(self, model_dir):
         m = _touch(model_dir / "my_model.safetensors", b"a" * 100)
         for name in ("my_model.yaml", "my_model.civitai.info", "my_model.json"):
