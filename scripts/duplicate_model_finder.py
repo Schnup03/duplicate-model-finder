@@ -185,6 +185,72 @@ def _bundle_stems(name: str) -> list[str]:
     return [".".join(parts[:index]) for index in range(1, len(parts)) if parts[:index]]
 
 
+def _entry_stems(entry: str) -> list[str]:
+    """Every prefix stem a sibling file name could be built on."""
+
+    parts = entry.split(".")
+    return [".".join(parts[:index]) for index in range(1, len(parts)) if parts[:index]]
+
+
+def _directory_listing(directory: str) -> list[str] | None:
+    """Sorted entries of a directory, or None when it cannot be read."""
+
+    try:
+        return sorted(os.listdir(directory))
+    except OSError:
+        return None
+
+
+def _companion_index(entries: Sequence[str]) -> dict[str, list[str]]:
+    """Map each prefix stem to the sibling names that can attach to it.
+
+    Built once per directory. Walking every entry for every model was
+    quadratic: a scan reporting 1500 duplicates re-read the same folder 1500
+    times.
+    """
+
+    index: dict[str, list[str]] = {}
+    for entry in entries:
+        if not _is_companion(entry):
+            continue
+        for stem in _entry_stems(entry):
+            index.setdefault(stem, []).append(entry)
+    return index
+
+
+def _companions_from_index(model_path: str, index: dict[str, list[str]]) -> list[str]:
+    """Companion lookup against a prebuilt per-directory index.
+
+    A sibling is listed when its name starts with one of the model's stems
+    and it carries a companion extension. When several models share a stem
+    chain — ``foo.ckpt`` and ``foo.bar.safetensors`` both own the stem
+    ``foo`` — a shared companion such as ``foo.bar.json`` is listed under both
+    models. There is no reliable way to tell them apart from the file names
+    alone, and the listing is read-only, so the ambiguity is documented
+    rather than guessed at.
+    """
+
+    if not os.path.isfile(model_path):
+        return []
+    base = os.path.basename(model_path)
+    stems = _bundle_stems(base)
+    if not stems:
+        return []
+    parent = os.path.dirname(os.path.abspath(model_path))
+    matched: set[str] = set()
+    for stem in stems:
+        for entry in index.get(stem, ()):
+            matched.add(entry)
+    found: list[str] = []
+    for entry in sorted(matched):
+        if entry == base:
+            continue
+        candidate = os.path.join(parent, entry)
+        if os.path.isfile(candidate) and not os.path.islink(candidate):
+            found.append(candidate)
+    return found
+
+
 def detect_bundle_members(model_path: str) -> list[str]:
     """Return the companion files that belong to ``model_path``.
 
@@ -199,22 +265,10 @@ def detect_bundle_members(model_path: str) -> list[str]:
     parent = os.path.dirname(os.path.abspath(model_path))
     if not os.path.isdir(parent):
         return []
-    stems = _bundle_stems(os.path.basename(model_path))
-    if not stems:
+    entries = _directory_listing(parent)
+    if entries is None:
         return []
-    found: list[str] = []
-    try:
-        entries = sorted(os.listdir(parent))
-    except OSError:
-        return []
-    base = os.path.basename(model_path)
-    for entry in entries:
-        if entry == base or not entry.startswith(tuple(f"{stem}." for stem in stems)):
-            continue
-        candidate = os.path.join(parent, entry)
-        if _is_companion(entry) and os.path.isfile(candidate) and not os.path.islink(candidate):
-            found.append(candidate)
-    return found
+    return _companions_from_index(model_path, _companion_index(entries))
 
 
 def total_bundle_size(model_path: str) -> int:
@@ -512,11 +566,19 @@ def format_duplicates_for_display(duplicates: dict[str, list[str]]) -> tuple[str
 
     lines: list[str] = []
     choices: list[str] = []
+    # One index per directory, not per model: a scan can return hundreds of
+    # duplicates from the same folder, and rescanning it for every path turned
+    # rendering the result into quadratic work.
+    indexes: dict[str, dict[str, list[str]]] = {}
     for file_hash, paths in duplicate_groups(duplicates).items():
         lines.append(f"Hash {file_hash}:")
         for path in paths:
             lines.append(f"  {path}")
-            companions = detect_bundle_members(path)
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent not in indexes:
+                entries = _directory_listing(parent)
+                indexes[parent] = {} if entries is None else _companion_index(entries)
+            companions = _companions_from_index(path, indexes[parent])
             if companions:
                 lines.append(f"    companions ({len(companions)}):")
                 lines.extend(f"      {name}" for name in companions)
