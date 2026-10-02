@@ -7,7 +7,11 @@ import time
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from functools import wraps
+from typing import Any
 
+# Gradio is optional: the module has to stay importable for the scan/delete
+# helpers and for the test suite, even where no WebUI environment exists.
+gr: Any
 try:
     import gradio as gr
 except ImportError:  # pragma: no cover - only triggered in test environments without Gradio
@@ -121,9 +125,9 @@ def _file_identity(path: str):
 
 def duplicate_groups(hashes: dict[str, list[str]]) -> dict[str, list[str]]:
     """Keep only groups containing at least two different physical files."""
-    result = {}
+    result: dict[str, list[str]] = {}
     for digest, paths in hashes.items():
-        unique = {}
+        unique: dict[Any, str] = {}
         for path in paths:
             unique.setdefault(_file_identity(path), path)
         if len(unique) > 1:
