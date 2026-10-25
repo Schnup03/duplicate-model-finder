@@ -69,6 +69,68 @@ def test_webui_model_directories_include_configured_roots(tmp_path, monkeypatch)
     assert str(tmp_path / "loras") in roots
 
 
+def test_webui_model_directories_include_forge_folder_lists(tmp_path, monkeypatch):
+    """Forge/Forge-Neo configure model folders as lists (``--ckpt-dirs`` …).
+
+    Only reading the A1111 spelling (``--ckpt-dir``) made the extension skip
+    every external model folder that Forge points at.
+    """
+    paths = types.SimpleNamespace(models_path=str(tmp_path / "webui_models"))
+    shared = types.SimpleNamespace(
+        cmd_opts=types.SimpleNamespace(
+            ckpt_dirs=[str(tmp_path / "checkpoints"), tmp_path / "extra_checkpoints"],
+            lora_dirs=[str(tmp_path / "loras")],
+            vae_dirs=[],
+        )
+    )
+    monkeypatch.setitem(sys.modules, "modules", types.SimpleNamespace(paths=paths, shared=shared))
+    roots = set(dmf.get_model_directories())
+    assert str(tmp_path / "webui_models" / "Stable-diffusion") in roots
+    assert str(tmp_path / "checkpoints") in roots
+    assert str(tmp_path / "extra_checkpoints") in roots
+    assert str(tmp_path / "loras") in roots
+
+
+def test_webui_model_directories_accept_a_single_folder_as_string(tmp_path, monkeypatch):
+    """A misconfigured single string must not crash the root resolution."""
+    paths = types.SimpleNamespace(models_path=str(tmp_path / "webui_models"))
+    shared = types.SimpleNamespace(cmd_opts=types.SimpleNamespace(ckpt_dirs=str(tmp_path / "only")))
+    monkeypatch.setitem(sys.modules, "modules", types.SimpleNamespace(paths=paths, shared=shared))
+    assert str(tmp_path / "only") in set(dmf.get_model_directories())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
+def test_windows_junction_model_root_is_scanned_and_trashed(tmp_path):
+    """Model folders that are junctions must be scanned and cleaned up.
+
+    Forge-Neo installations commonly junction ``models/Lora`` and
+    ``models/VAE`` to a central model library.
+    """
+    import _winapi
+
+    real_root = tmp_path / "real_models"
+    link_root = tmp_path / "linked_models"
+    real_root.mkdir()
+    _winapi.CreateJunction(str(real_root), str(link_root))
+    try:
+        first = link_root / "first.ckpt"
+        second = link_root / "second.ckpt"
+        first.write_bytes(b"same")
+        second.write_bytes(b"same")
+
+        duplicates = dmf.find_duplicates([str(link_root)])
+        assert len(duplicates) == 1
+        assert sorted(next(iter(duplicates.values()))) == sorted([str(first), str(second)])
+
+        status, failed = dmf.move_files_to_trash([str(second)], allowed_roots=[str(link_root)])
+        assert failed == []
+        assert "Moved 1" in status
+        assert not second.exists()
+        assert (real_root / dmf.TRASH_DIR_NAME).is_dir()
+    finally:
+        os.rmdir(link_root)  # Remove the junction only, never its target.
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction regression")
 def test_windows_junctions_cannot_move_or_delete_external_models(tmp_path):
     import _winapi
@@ -250,5 +312,27 @@ def test_ui_cancel_confirmation_and_empty_trash_controls(tmp_path, ui_bindings, 
     disposed_at = datetime.now(timezone.utc) - timedelta(days=90)
     (trash / f"{disposed_at:%Y%m%dT%H%M%S%f}_old.ckpt").write_bytes(b"old")
     empty = ui_bindings["Empty trash"]
-    assert "confirmation required" in empty["fn"](False)
-    assert "Purged 1" in empty["fn"](True)
+    assert "confirmation required" in empty["fn"](False)[0]
+    assert "Purged 1" in empty["fn"](True)[0]
+
+
+def test_ui_confirmation_checkbox_is_reset_after_every_destructive_click(tmp_path, ui_bindings):
+    """A ticked confirmation box must not authorise the next batch silently."""
+    first = tmp_path / "first.ckpt"
+    second = tmp_path / "second.ckpt"
+    first.write_bytes(b"same")
+    second.write_bytes(b"same")
+
+    scan = ui_bindings["Scan for duplicates"]["fn"]
+    snapshot = list(scan(False))[-1][2]
+
+    delete = ui_bindings["Permanently delete selected"]
+    result = delete["fn"]([str(second)], snapshot, True)
+    # The confirm checkbox is the last output and must be cleared again.
+    assert result[4] == {"value": False}
+    assert not second.exists()
+
+    empty = ui_bindings["Empty trash"]
+    status, confirm_update = empty["fn"](True)
+    assert confirm_update == {"value": False}
+    assert "Purged" in status

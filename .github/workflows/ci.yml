@@ -66,7 +66,7 @@ jobs:
       - name: Install WebUI Gradio and tests
         run: python -m pip install pytest 'gradio==3.41.2' 'huggingface-hub<1'
       - name: Run Gradio integration tests
-        run: python -m pytest tests/test_real_gradio_ui.py -v --tb=short
+        run: python -m pytest tests/test_real_gradio_ui.py tests/test_gradio_compat.py -v --tb=short
 
   lint:
     name: ruff + mypy

@@ -89,4 +89,11 @@ filterwarnings = [
   "ignore::DeprecationWarning:fastapi.*",
   "ignore::DeprecationWarning:starlette.*",
   "ignore:.*on_event is deprecated.*:DeprecationWarning",
+  # Gradio 4.x (the version Forge-Neo ships) pulls in `multipart`, which
+  # raises a PendingDeprecationWarning on import. Without these ignores the
+  # whole suite fails to collect in a real WebUI environment.
+  "ignore::PendingDeprecationWarning:gradio.*",
+  "ignore::PendingDeprecationWarning:multipart.*",
+  "ignore::PendingDeprecationWarning:fastapi.*",
+  "ignore::PendingDeprecationWarning:starlette.*",
 ]

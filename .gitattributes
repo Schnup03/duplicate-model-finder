@@ -1,0 +1,14 @@
+# Normalize line endings so that a clone on Windows and a clone on Linux
+# contain byte-identical files. Without this, a file committed from Windows
+# can end up with CRLF in the repository while all other files use LF.
+* text=auto eol=lf
+
+# Binary files must never be touched by the text conversion above.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ckpt binary
+*.safetensors binary
+*.pt binary

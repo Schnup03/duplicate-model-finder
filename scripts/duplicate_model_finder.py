@@ -58,6 +58,32 @@ def _real_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+def _configured_model_directories(options: Any) -> list[str]:
+    """Read the model folders the running WebUI was pointed at.
+
+    A1111 configures one folder per category (``--ckpt-dir``), Forge and
+    Forge-Neo configure a *list* per category (``--ckpt-dirs``) — that is how
+    an external model library is attached (``--forge-ref-a1111-home``,
+    ``--forge-ref-comfy-home``). Only reading the singular spelling made the
+    extension skip every such external folder, so both are honoured here.
+    """
+    directories: list[str] = []
+    for name in ("ckpt_dir", "lora_dir", "vae_dir"):
+        configured = getattr(options, name, None)
+        if configured:
+            directories.append(os.fspath(configured))
+    for name in ("ckpt_dirs", "lora_dirs", "vae_dirs"):
+        configured = getattr(options, name, None)
+        if not configured:
+            continue
+        if isinstance(configured, (str, os.PathLike)):
+            configured = [configured]
+        for entry in configured:
+            if entry:
+                directories.append(os.fspath(entry))
+    return directories
+
+
 def get_model_directories() -> list[str]:
     """Resolve the running WebUI's roots; keep MODEL_DIRS as standalone fallback."""
     try:
@@ -72,10 +98,8 @@ def get_model_directories() -> list[str]:
             else list(MODEL_DIRS)
         )
         options = getattr(shared, "cmd_opts", None)
-        for name in ("ckpt_dir", "lora_dir", "vae_dir"):
-            configured = getattr(options, name, None)
-            if configured:
-                directories.append(configured)
+        if options is not None:
+            directories.extend(_configured_model_directories(options))
     unique: dict[str, str] = {}
     for directory in directories:
         absolute = os.path.abspath(directory)
@@ -408,7 +432,8 @@ def _size_duplicate_candidates(
 
     Files whose size is unique cannot be duplicates of any other file, so we
     skip the expensive SHA256 hashing step for them. When ``stop_event`` is
-    supplied the loop returns whatever it has collected so far.
+    set the prefilter is aborted and no candidates are returned — a cancelled
+    scan reports no duplicates instead of an incomplete set.
     """
 
     size_groups: dict[int, list[str]] = {}
@@ -461,9 +486,10 @@ def collect_hashes(
     from ``max_workers`` (when given) or the CPU count. Pass ``max_workers=1``
     to disable parallelism, e.g. for deterministic tests.
 
-    When ``stop_event`` is supplied the function returns whatever it has
-    accumulated so far; the threaded executor is released via its context
-    manager on exit.
+    When ``stop_event`` is supplied the scan is aborted cooperatively: a
+    scan that is cancelled before the hashing starts returns an empty result,
+    a scan cancelled while hashing returns the duplicates found so far. The
+    threaded executor is released via its context manager on exit.
     """
 
     paths = [str(path) for path in file_paths]
@@ -1056,16 +1082,20 @@ def on_ui_tabs():
             return handle_selection(selected, snapshot)
 
         def do_delete(selected, snapshot, confirm):
-            return handle_selection(selected, snapshot, permanent=True, confirm=confirm)
+            # The confirmation checkbox is reset on every click. A permanent
+            # deletion is irreversible, so the confirmation must not stay
+            # ticked and authorise the next batch without a fresh tick.
+            result = handle_selection(selected, snapshot, permanent=True, confirm=confirm)
+            return (*result, gr.update(value=False))
 
         def do_empty_trash(confirm: bool):
             """Permanently delete all trash files older than the retention window."""
             if not confirm:
-                return "Empty-trash cancelled: confirmation required"
+                return "Empty-trash cancelled: confirmation required", gr.update(value=False)
             if not _ui_operation_lock.acquire(blocking=False):
-                return "A scan or file operation is running"
+                return "A scan or file operation is running", gr.update(value=False)
             try:
-                return purge_old_trash()[0]
+                return purge_old_trash()[0], gr.update(value=False)
             finally:
                 _ui_operation_lock.release()
 
@@ -1093,12 +1123,12 @@ def on_ui_tabs():
         delete_btn.click(
             fn=do_delete,
             inputs=[delete_choices, choices_state, confirm_check],
-            outputs=[duplicates_box, delete_choices, choices_state, result_box],
+            outputs=[duplicates_box, delete_choices, choices_state, result_box, confirm_check],
         )
         empty_trash_btn.click(
             fn=do_empty_trash,
             inputs=empty_trash_confirm,
-            outputs=result_box,
+            outputs=[result_box, empty_trash_confirm],
         )
 
     _ui_tab_mounted = True
