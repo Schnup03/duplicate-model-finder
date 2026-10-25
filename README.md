@@ -2,7 +2,7 @@
 
 Erweiterung für [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) und kompatible WebUI-Forks. Sie findet physisch verschiedene, inhaltlich identische Modelldateien und zeigt sie im Tab **Duplicate Models** an.
 
-Unterstützt werden `.ckpt`, `.safetensors` und `.pt` in den Kategorien `Stable-diffusion`, `Lora` und `VAE`. Der Scan übernimmt den aktuellen Modellstamm der WebUI und zusätzlich konfigurierte Checkpoint-, LoRA- und VAE-Ordner. Außerhalb der WebUI verwendet er die relativen Standardordner `models/Stable-diffusion`, `models/Lora` und `models/VAE`.
+Unterstützt werden `.ckpt`, `.safetensors` und `.pt` in den Kategorien `Stable-diffusion`, `Lora` und `VAE`. Der Scan übernimmt den aktuellen Modellstamm der WebUI und zusätzlich konfigurierte Checkpoint-, LoRA- und VAE-Ordner — sowohl in der A1111-Schreibweise (`--ckpt-dir`) als auch in der Forge-/Forge-Neo-Schreibweise (`--ckpt-dirs`, `--lora-dirs`, `--vae-dirs`), über die auch externe Modellbibliotheken eingebunden werden. Außerhalb der WebUI verwendet er die relativen Standardordner `models/Stable-diffusion`, `models/Lora` und `models/VAE`.
 
 ## Installation
 
@@ -22,8 +22,8 @@ Der Tab enthält folgende sichtbaren Aktionen:
 | **Select extra copies** | Wählt in jeder Gruppe die zusätzlichen, löschbaren Kopien aus und lässt mindestens eine Kopie stehen. Einzelne Dateien können auch von Hand gewählt werden. |
 | **Cancel scan** | Bricht die laufende Suche kooperativ ab. Eine bereits begonnene Hash-Berechnung kann noch zu Ende laufen. |
 | **Move selected to trash** | Verschiebt ausgewählte Dateien in einen wiederherstellbaren Schwesterordner. Die Trefferliste wird danach aktualisiert. |
-| **Permanently delete selected** | Löscht nur nach Aktivierung der gesonderten Bestätigungs-Checkbox. Die letzte Kopie einer Treffergruppe bleibt geschützt. |
-| **Empty trash** | Löscht nach gesonderter Bestätigung Papierkorbdateien, die **seit dem Aussortieren** mindestens 30 Tage alt sind. Jüngere Dateien bleiben erhalten. |
+| **Permanently delete selected** | Löscht nur nach Aktivierung der gesonderten Bestätigungs-Checkbox. Die letzte Kopie einer Treffergruppe bleibt geschützt. Die Checkbox wird nach jedem Klick zurückgesetzt, damit jede Löschung neu bestätigt werden muss. |
+| **Empty trash** | Löscht nach gesonderter Bestätigung Papierkorbdateien, die **seit dem Aussortieren** mindestens 30 Tage alt sind. Jüngere Dateien bleiben erhalten. Die Bestätigungs-Checkbox wird nach jedem Klick zurückgesetzt. |
 
 Dateien außerhalb der konfigurierten Modellordner können über Verzeichnisverknüpfungen sichtbar sein, sind aber in der Lösch-Auswahl gesperrt. Der tatsächliche Dateipfad wird unmittelbar vor einer Dateiaktion gegen die erlaubten Modellordner geprüft. Papierkorbdateien erscheinen nicht als neue Duplikate. Der Scanner erkennt auch zyklische Verzeichnisverknüpfungen.
 
@@ -71,6 +71,8 @@ pytest -v
 ```
 
 Die CI prüft Python 3.10–3.12 unter Linux, Python 3.12 unter Windows mit echten Junctions sowie die Bedienoberfläche mit Gradio 3.41.2. Der separate Secret-Scan prüft die Git-Historie.
+
+Die Testsuite läuft auch in einer echten WebUI-Umgebung mit Gradio 4.x (Forge-Neo): Drittanbieter-Warnungen von Gradio, FastAPI, Starlette und `multipart` werden dabei nicht als Fehler gewertet.
 
 ## Grenzen
 

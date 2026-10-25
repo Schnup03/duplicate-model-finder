@@ -48,6 +48,7 @@ def test_registered_gradio_controls_cover_all_actions(monkeypatch):
         "select_extra_copies": 1,
         "cancel_scan": 1,
         "do_trash": 4,
-        "do_delete": 4,
-        "do_empty_trash": 1,
+        # The destructive actions also reset their confirmation checkbox.
+        "do_delete": 5,
+        "do_empty_trash": 2,
     }

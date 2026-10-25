@@ -76,7 +76,10 @@ class TestDetectBundleMembers:
     def test_symlinked_companion_is_skipped(self, model_dir, tmp_path):
         m = _touch(model_dir / "my_model.safetensors", b"a" * 100)
         outside = _touch(tmp_path / "secret.json", b"{}")
-        os.symlink(outside, model_dir / "my_model.json")
+        try:
+            os.symlink(outside, model_dir / "my_model.json")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
         assert dmf.detect_bundle_members(str(m)) == []
 
     def test_shared_stem_chain_is_reported_under_both_models(self, model_dir):
