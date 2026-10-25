@@ -59,5 +59,6 @@ def test_real_gradio_delete_resets_the_confirmation_checkbox(tmp_path, monkeypat
     result = functions["do_delete"]([str(second)], snapshot, True)
 
     assert not second.exists()
-    assert result[4]["__type__"] == "update"
+    # The marker differs between Gradio versions ("update" vs "generic_update"),
+    # the payload does not.
     assert result[4]["value"] is False
